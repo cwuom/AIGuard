@@ -1,0 +1,7 @@
+.build/
+build/
+# 内核二进制与规则库由 scripts/fetch-core.sh 下载并校验
+Vendor/
+*.xcuserstate
+.DS_Store
+.swiftpm/
