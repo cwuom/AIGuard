@@ -194,6 +194,19 @@ struct TraceAndSettingsTests {
         #expect(old.eventsGeneration == nil && old.events == [])
     }
 
+    @Test func launchAtLoginDefaultsOnOnceAndOnlyWhenInstalled() {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        #expect(LaunchAtLoginPolicy.shouldApplyDefault(alreadyApplied: false, bundlePath: "/Applications/AIGuard.app"))
+        #expect(LaunchAtLoginPolicy.shouldApplyDefault(alreadyApplied: false, bundlePath: home + "/Applications/AIGuard.app"))
+        // 用户关过（或已经默认开过一次）就不再强开
+        #expect(!LaunchAtLoginPolicy.shouldApplyDefault(alreadyApplied: true, bundlePath: "/Applications/AIGuard.app"))
+        // 从 DMG、构建目录运行时登记的路径会失效
+        #expect(!LaunchAtLoginPolicy.shouldApplyDefault(alreadyApplied: false, bundlePath: "/Volumes/AI 出差管家/AIGuard.app"))
+        #expect(!LaunchAtLoginPolicy.shouldApplyDefault(alreadyApplied: false, bundlePath: "/Users/x/Desktop/AIGuard/build/AIGuard.app"))
+        #expect(!LaunchAtLoginPolicy.isInstalledLocation("/Applications/../Volumes/x/AIGuard.app"))
+        #expect(!LaunchAtLoginPolicy.isInstalledLocation("/Applications/AIGuard"))
+    }
+
     @Test func versionOrdering() {
         #expect(compareVersions("1.2.1", "1.2.0") == .orderedDescending)
         #expect(compareVersions("1.10.0", "1.9.9") == .orderedDescending)

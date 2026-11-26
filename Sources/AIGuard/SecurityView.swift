@@ -1,4 +1,5 @@
 import AIGuardCore
+import ServiceManagement
 import SwiftUI
 
 struct SecurityView: View {
@@ -72,6 +73,8 @@ struct SecurityView: View {
                         }
                     }
 
+                    LaunchAtLoginCard()
+
                     GlassCard(tint: Palette.danger) {
                         HStack {
                             SectionHeader(title: "关闭全部守护", subtitle: "停止内核、撤销 TUN 和防火墙。出差期间不建议关闭。")
@@ -111,6 +114,33 @@ struct SecurityView: View {
             Spacer()
             Toggle(label, isOn: bind(key)).toggleStyle(.switch).labelsHidden()
         }
+    }
+}
+
+private struct LaunchAtLoginCard: View {
+    @Environment(GuardStore.self) private var store
+
+    var body: some View {
+        GlassCard {
+            VStack(alignment: .leading, spacing: 10) {
+                Toggle(isOn: Binding(get: { store.launchAtLogin == .enabled || store.launchAtLogin == .requiresApproval },
+                                     set: { store.setLaunchAtLogin($0) })) {
+                    SectionHeader(title: "登录时启动",
+                                  subtitle: "登录后自动在菜单栏运行，随时看到防护状态。守护进程和熔断保护本来就随开机运行，关掉这里不影响保护。")
+                }
+                .toggleStyle(.switch)
+                if store.launchAtLogin == .requiresApproval {
+                    HStack(spacing: 10) {
+                        Label("需要在系统设置里允许", systemImage: "exclamationmark.triangle")
+                            .font(.callout).foregroundStyle(Palette.caution)
+                        Button("打开登录项设置") { SMAppService.openSystemSettingsLoginItems() }
+                            .buttonStyle(.glass)
+                    }
+                }
+            }
+        }
+        // 用户可能刚在系统设置里改过，回到页面时重新读一次
+        .onAppear { store.refreshLaunchAtLogin() }
     }
 }
 

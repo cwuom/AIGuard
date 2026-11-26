@@ -2,6 +2,7 @@ import AIGuardCore
 import AppKit
 import Foundation
 import Observation
+import ServiceManagement
 
 /// 界面状态中心：轮询守护进程，转发用户操作。所有阻塞 IO 都在后台线程
 @Observable
@@ -31,6 +32,8 @@ final class GuardStore {
     var connections: MihomoAPI.ConnectionsSnapshot?
     /// 验证失败后弹出「是否重启内核」
     var askRestartCore = false
+    /// 界面 App 的登录项状态（守护进程是 LaunchDaemon，开机即运行，与此无关）
+    var launchAtLogin: SMAppService.Status = SMAppService.mainApp.status
 
     struct Notice: Equatable {
         var text: String
@@ -329,6 +332,49 @@ final class GuardStore {
     private nonisolated func shellQuote(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
     private nonisolated func appleScriptQuote(_ s: String) -> String {
         "\"" + s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
+    }
+
+    // MARK: - 登录时启动
+
+    private static let launchAtLoginDefaultKey = "launchAtLoginDefaultApplied"
+
+    /// 首次从「应用程序」运行时默认开启一次；之后完全尊重用户在 App 或系统设置里的选择
+    func applyLaunchAtLoginDefault() {
+        let defaults = UserDefaults.standard
+        guard LaunchAtLoginPolicy.shouldApplyDefault(alreadyApplied: defaults.bool(forKey: Self.launchAtLoginDefaultKey),
+                                                     bundlePath: Bundle.main.bundlePath) else {
+            refreshLaunchAtLogin()
+            return
+        }
+        defaults.set(true, forKey: Self.launchAtLoginDefaultKey)
+        if SMAppService.mainApp.status != .enabled { try? SMAppService.mainApp.register() }
+        refreshLaunchAtLogin()
+    }
+
+    func refreshLaunchAtLogin() {
+        launchAtLogin = SMAppService.mainApp.status
+    }
+
+    func setLaunchAtLogin(_ on: Bool) {
+        do {
+            if on {
+                guard LaunchAtLoginPolicy.isInstalledLocation(Bundle.main.bundlePath) else {
+                    notice = Notice(text: "请先把 AIGuard 拖进「应用程序」再开启，否则登录时会找不到它", isError: true)
+                    return
+                }
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+        } catch {
+            notice = Notice(text: "\(on ? "开启" : "关闭")登录时启动失败：\(error.localizedDescription)", isError: true)
+        }
+        // 用户手动操作过，默认值不再生效
+        UserDefaults.standard.set(true, forKey: Self.launchAtLoginDefaultKey)
+        refreshLaunchAtLogin()
+        if launchAtLogin == .requiresApproval {
+            notice = Notice(text: "还需要在「系统设置 › 通用 › 登录项」里允许 AI 出差管家", isError: false)
+        }
     }
 
     func copyTerminalProxy() {

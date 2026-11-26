@@ -237,3 +237,18 @@ public enum DomainSanitizer {
         return out
     }
 }
+
+/// 登录时启动（界面 App 的登录项）的默认值策略。守护进程本身是 LaunchDaemon，开机就运行，不归这里管
+public enum LaunchAtLoginPolicy {
+    /// 默认开启只做一次：用户之后在 App 或系统设置里关掉，不能再被强行打开。
+    /// 只在 App 装进「应用程序」后才登记，从 DMG 或构建目录直接运行时登记的路径会失效
+    public static func shouldApplyDefault(alreadyApplied: Bool, bundlePath: String) -> Bool {
+        !alreadyApplied && isInstalledLocation(bundlePath)
+    }
+
+    public static func isInstalledLocation(_ bundlePath: String) -> Bool {
+        let path = (bundlePath as NSString).standardizingPath
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return path.hasSuffix(".app") && (path.hasPrefix("/Applications/") || path.hasPrefix(home + "/Applications/"))
+    }
+}
