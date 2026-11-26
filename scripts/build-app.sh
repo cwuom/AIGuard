@@ -20,6 +20,7 @@ cp "$BIN/aiguardd" "$APP/Contents/Resources/aiguardd"
 cp Vendor/mihomo "$APP/Contents/Resources/mihomo"
 cp Vendor/rules/*.mrs Vendor/rules/cn4.txt "$APP/Contents/Resources/rules/"
 cp scripts/install.sh scripts/uninstall.sh "$APP/Contents/Resources/"
+cp LICENSE THIRD_PARTY_NOTICES.md "$APP/Contents/Resources/"
 chmod 755 "$APP/Contents/Resources/"{aiguardd,mihomo,install.sh,uninstall.sh}
 
 ICONSET="$ROOT/build/AppIcon.iconset"

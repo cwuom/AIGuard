@@ -128,3 +128,7 @@ sudo /Applications/AIGuard.app/Contents/Resources/uninstall.sh --purge
 - 本机以你的身份运行的恶意程序可以读取内核控制密钥（界面需要它来切节点），守护进程每 30 秒会重新下发闸门状态，但无法完全防住本机恶意程序。
 - 长连接心跳每 2 秒约 1 KB，全天约 50 MB 代理流量；可在设置里调大间隔。
 - 出口国家依赖 Cloudflare trace / ipinfo 的地理库，个别节点可能被误判；误判方向是多熔断而不是少熔断。
+
+## 📄 许可证
+
+本项目以 [GPL-3.0](LICENSE) 发布。打包进 App 的 mihomo（MIT）和 meta-rules-dat 规则数据（GPL-3.0）等第三方组件，见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
