@@ -40,8 +40,8 @@ umask(0o077)
 signal(SIGPIPE, SIG_IGN)
 Log.open(dir: logDir)
 
-let guardian = Guardian(paths: DaemonPaths(helperDir: helperDir, supportDir: supportDir, logDir: logDir),
-                        allowedUIDs: allowedUIDs, dev: devMode)
+let guardianPaths = DaemonPaths(helperDir: helperDir, supportDir: supportDir, logDir: logDir)
+let guardian = Guardian(paths: guardianPaths, allowedUIDs: allowedUIDs, dev: devMode)
 
 /// 从回调线程同步等待 actor 完成，用于睡眠前断网这类必须先完成的动作
 func blocking(timeout: TimeInterval, _ work: @escaping @Sendable () async -> Void) {
@@ -76,10 +76,12 @@ for sig in [SIGTERM, SIGINT] {
     signal(sig, SIG_IGN)
     let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
     src.setEventHandler {
-        // 先停网络回调、直接撤掉防火墙（不等 actor），保证退出后不会残留断网规则
+        // 先停网络回调、直接处理防火墙（不等 actor）。普通退出撤掉规则，保证不残留断网；
+        // 升级交接时保持全部断网，否则新版启动前的几秒里应用会绕过代理直连
         network.stop()
-        guardian.pf.teardown()
-        blocking(timeout: 10) { await guardian.shutdown() }
+        let hold = !devMode && guardianPaths.upgradeHoldActive()
+        if hold { guardian.pf.holdLockdownOnExit() } else { guardian.pf.teardown() }
+        blocking(timeout: 10) { await guardian.shutdown(holdNetwork: hold) }
         ipc.stop()
         exit(0)
     }

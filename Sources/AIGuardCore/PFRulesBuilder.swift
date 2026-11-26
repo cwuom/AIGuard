@@ -35,8 +35,9 @@ public enum PFRulesBuilder {
 
     /// DNS 防泄漏：除 root（内核自己的上游解析）外，53/853 端口只能经 TUN 发出，
     /// 发往路由器/酒店 DNS 的明文查询一律拒绝
+    /// root 例外只放 IPv4：内核不用 IPv6，若物理网卡仍有 IPv6 路由，其他 root 进程的 DNS 不能借道漏出
     static let dnsGuard = [
-        "pass out quick proto { tcp udp } from any to any port { 53 853 } user 0 no state",
+        "pass out quick inet proto { tcp udp } from any to any port { 53 853 } user 0 no state",
         "block return out quick proto { tcp udp } from any to any port { 53 853 }",
     ]
     static let ipv6Guard = [
@@ -68,6 +69,10 @@ public enum PFRulesBuilder {
             r += ["table <\(cnTable)> persist file \"\(cnFile)\""]
             if !ips.isEmpty { r += ["table <\(allowTable)> { \(ips.joined(separator: " ")) }"] }
             r += ["pass quick on lo0 all no state"]
+            // 闸门确认后放行 TUN，且必须在 DNS 封锁之前：系统 DNS 锁在 TUN 里，否则应用连大陆域名都解析不了。
+            // TUN 里的流量由内核闸门把关（境外与 AI 已是 REJECT），与平时的防泄漏策略同序
+            // 只放 IPv4：这条排在 IPv6 封锁之前，不能顺带放行 IPv6
+            if allowTUN { r += ["pass out quick on \(tun) inet all no state"] }
             // 白名单下内核自己的 DNS 只能发往大陆 DNS（223.5.5.5 等）和局域网（酒店 DHCP DNS）
             r += [
                 "pass out quick proto { tcp udp } from any to <\(cnTable)> port { 53 853 } user 0 no state",
@@ -79,7 +84,6 @@ public enum PFRulesBuilder {
                 "pass out quick inet from any to \(lan) no state",
                 "pass out quick inet proto udp from any port 68 to any port 67 no state",
             ]
-            if allowTUN { r += ["pass out quick on \(tun) all no state"] }
             r += ["pass out quick inet from any to <\(cnTable)> no state"]
             if !ips.isEmpty { r += ["pass out quick proto { tcp udp } from any to <\(allowTable)> user 0 no state"] }
             r += ["block return out quick all"]

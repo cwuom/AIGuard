@@ -48,10 +48,15 @@ private struct GroupSection: View {
                 Button {
                     Task { await store.testGroup(group) }
                 } label: {
-                    if store.testingGroup == group { ProgressView().controlSize(.small) } else { Label("测速", systemImage: "speedometer") }
+                    if store.testingGroup == group {
+                        Label { Text("测速中…") } icon: { ProgressView().controlSize(.small) }
+                    } else {
+                        Label("全部测速", systemImage: "speedometer")
+                    }
                 }
                 .buttonStyle(.glass)
                 .disabled(store.testingGroup != nil)
+                .help("并发测试组内全部节点的延迟（经代理访问 cp.cloudflare.com）")
             }
             if let now = info?.now {
                 Text("当前：\(now)\(resolved(now).map { " → \($0)" } ?? "")")
@@ -60,7 +65,7 @@ private struct GroupSection: View {
             GlassEffectContainer(spacing: 10) {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 180), spacing: 10)], spacing: 10) {
                     ForEach(members, id: \.self) { name in
-                        NodeTile(name: name, delay: delay(of: name), selected: info?.now == name,
+                        NodeTile(name: name, delay: delay(of: name), tested: tested(name), selected: info?.now == name,
                                  isGroup: store.proxies[name]?.all.isEmpty == false) {
                             Task { await store.select(group: group, node: name) }
                         }
@@ -79,6 +84,11 @@ private struct GroupSection: View {
         return resolved(now) ?? now
     }
 
+    private func tested(_ name: String) -> Bool {
+        if store.proxies[name]?.tested == true { return true }
+        return resolved(name).flatMap { store.proxies[$0]?.tested } ?? false
+    }
+
     private func delay(of name: String) -> Int? {
         if let p = store.proxies[name], let d = p.lastDelay { return d }
         if let r = resolved(name) { return store.proxies[r]?.lastDelay }
@@ -89,6 +99,7 @@ private struct GroupSection: View {
 private struct NodeTile: View {
     var name: String
     var delay: Int?
+    var tested: Bool
     var selected: Bool
     var isGroup: Bool
     var action: () -> Void
@@ -99,9 +110,9 @@ private struct NodeTile: View {
                 if isGroup { Image(systemName: "sparkles").foregroundStyle(Palette.accent) }
                 Text(name).font(.callout.weight(selected ? .semibold : .regular)).lineLimit(1).truncationMode(.middle)
                 Spacer(minLength: 4)
-                Text(delay.map { "\($0)" } ?? "—")
+                Text(delay.map { "\($0) ms" } ?? (tested ? "超时" : "—"))
                     .font(.caption.monospacedDigit().weight(.semibold))
-                    .foregroundStyle(delay == nil ? Color.secondary : Format.delayColor(delay))
+                    .foregroundStyle(delay == nil && !tested ? Color.secondary : Format.delayColor(delay))
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
@@ -110,7 +121,7 @@ private struct NodeTile: View {
         .buttonStyle(.plain)
         .glassEffect(selected ? .regular.tint(Palette.accent.opacity(0.25)).interactive() : .regular.interactive(),
                      in: .rect(cornerRadius: 12))
-        .accessibilityLabel("\(name)，\(delay.map { "延迟 \($0) 毫秒" } ?? "未测速")")
+        .accessibilityLabel("\(name)，\(delay.map { "延迟 \($0) 毫秒" } ?? (tested ? "超时" : "未测速"))")
         .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }

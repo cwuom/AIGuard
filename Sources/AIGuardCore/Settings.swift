@@ -29,6 +29,12 @@ public struct SubscriptionUsage: Codable, Sendable, Equatable {
     public var total: Int64
     public var expire: Date?
 
+    /// 机场给的数值不可信，相加可能溢出 Int64 让界面崩溃，溢出时取上限
+    public var used: Int64 {
+        let (sum, overflow) = upload.addingReportingOverflow(download)
+        return overflow ? .max : sum
+    }
+
     public init(upload: Int64, download: Int64, total: Int64, expire: Date?) {
         self.upload = upload
         self.download = download
@@ -117,6 +123,8 @@ public struct GuardSettings: Codable, Sendable, Equatable {
     public var disabledAICategories: [String] = []
     public var customAIDomains: [String] = []
     public var customDirectDomains: [String] = []
+    /// 智能分流下强制走代理的域名，用来纠正大陆名单误收的境外站点
+    public var customProxyDomains: [String] = []
     public var subscription: SubscriptionInfo?
     public var subscriptionUpdateHours = 12
     public var mixedPort = 7890
@@ -127,7 +135,8 @@ public struct GuardSettings: Codable, Sendable, Equatable {
         case schema, enabled, mode, routing, fuseEnabled, fuseAction, autoRecover, probeIntervalSeconds, failureThreshold
         case latencyThresholdMs, recoverSuccesses, wakeHoldSeconds, forbiddenRegions, autoSwitchUnsafeNode
         case closeAppsOnFuse, closeAppsOnGuardTrips, leakGuard, directOnlyMainland, disableSystemIPv6
-        case lockSystemDNS, disabledAICategories, customAIDomains, customDirectDomains, subscription
+        case lockSystemDNS, disabledAICategories, customAIDomains, customDirectDomains, customProxyDomains
+        case subscription
         case subscriptionUpdateHours, mixedPort
     }
 
@@ -167,6 +176,7 @@ public struct GuardSettings: Codable, Sendable, Equatable {
         disabledAICategories = try c.decodeIfPresent([String].self, forKey: .disabledAICategories) ?? d.disabledAICategories
         customAIDomains = try c.decodeIfPresent([String].self, forKey: .customAIDomains) ?? d.customAIDomains
         customDirectDomains = try c.decodeIfPresent([String].self, forKey: .customDirectDomains) ?? d.customDirectDomains
+        customProxyDomains = try c.decodeIfPresent([String].self, forKey: .customProxyDomains) ?? d.customProxyDomains
         subscription = try c.decodeIfPresent(SubscriptionInfo.self, forKey: .subscription)
         subscriptionUpdateHours = try c.decodeIfPresent(Int.self, forKey: .subscriptionUpdateHours) ?? d.subscriptionUpdateHours
         mixedPort = try c.decodeIfPresent(Int.self, forKey: .mixedPort) ?? d.mixedPort
@@ -197,6 +207,7 @@ public struct GuardSettings: Codable, Sendable, Equatable {
         if !s.forbiddenRegions.contains("CN") { s.forbiddenRegions.insert("CN", at: 0) }
         s.customAIDomains = DomainSanitizer.clean(s.customAIDomains)
         s.customDirectDomains = DomainSanitizer.clean(s.customDirectDomains)
+        s.customProxyDomains = DomainSanitizer.clean(s.customProxyDomains)
         return s
     }
 

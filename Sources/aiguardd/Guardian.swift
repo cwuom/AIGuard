@@ -14,6 +14,16 @@ struct DaemonPaths {
     var mihomo: String { helperDir + "/mihomo" }
     var bundledRules: String { helperDir + "/rules" }
     var cnTable: String { bundledRules + "/cn4.txt" }
+    /// install.sh 升级前写入：旧守护进程退出时保留断网，直到新版接管
+    var upgradeHoldFile: String { supportDir + "/upgrade-hold" }
+
+    /// 标记只在 root 创建、且是最近 5 分钟内的才算数，避免残留标记让正常退出也断网
+    func upgradeHoldActive(now: Date = Date()) -> Bool {
+        var st = stat()
+        guard lstat(upgradeHoldFile, &st) == 0, st.st_uid == 0, (st.st_mode & S_IFMT) == S_IFREG else { return false }
+        let mtime = Date(timeIntervalSince1970: TimeInterval(st.st_mtimespec.tv_sec))
+        return abs(now.timeIntervalSince(mtime)) < 300
+    }
 }
 
 private struct RuntimeSecrets: Codable {
@@ -39,6 +49,8 @@ actor Guardian {
 
     private var events: [GuardEvent] = []
     private var nextEventID = 1
+    /// 守护进程每次启动或清空事件都换一个代号，界面据此判断要不要整表重建
+    private var eventsGeneration = UUID().uuidString
     private var eventsDirty = false
     private var latency: [LatencySample] = []
     private var exitStatus = ExitStatus()
@@ -69,6 +81,12 @@ actor Guardian {
     private var lastCoreTransition: Date?
     /// 白名单熔断时闸门是否已确认写成 REJECT；确认之前不放行进入 TUN 的流量
     private var softGatesConfirmed = false
+    /// 进出熔断、内核重启/重载时加一；跨 await 的闸门确认据此丢弃过期结果
+    private var gateGeneration = 0
+    /// 内核启动/重载进行中（可嵌套）：这期间闸门回读不可信，不允许确认放行 TUN
+    private var coreTransitions = 0
+    /// 上次配置没能写出：之后即使设置不变也要重试应用，不能回报「已生效」
+    private var configApplyPending = false
     /// pf 加载失败只在状态变化时记一次，避免每秒刷屏
     private var pfFailing = false
     private var lastAIScan: Date?
@@ -149,16 +167,21 @@ actor Guardian {
     // MARK: - 生命周期
 
     func boot() async {
+        // 新版已经接管，升级保持标记作废
+        unlink(paths.upgradeHoldFile)
         syncBundledRules()
         core.killStale()
         coreVersion = core.version()
         core.onExit = { [weak self] code in
             Task { await self?.coreExited(code) }
         }
-        log(.info, "守护进程启动 v\(AIGuardVersion)，内核 \(coreVersion ?? "未知")")
+        log(.info, "守护进程已启动（v\(AIGuardVersion)，mihomo \(coreVersion ?? "版本未知")）")
         // 设置文件按新格式写回（1.0 → 1.1 的迁移结果落盘）
         saveSettings()
         pf.removeLegacyAnchors()
+        // 锚点里可能留着上一个进程的规则（升级保持的全部断网、崩溃残留），新进程的缓存却是 .none：
+        // 强制按当前期望重装一次，守护已关闭时也要真正清掉，不能因为「没变化」跳过
+        pf.apply(desiredPF, force: true)
         // 先上防火墙再启动内核：启动阶段默认熔断
         applyProtection()
         syncSystemNetwork()
@@ -178,16 +201,18 @@ actor Guardian {
         }
     }
 
-    func shutdown() {
+    /// holdNetwork：升级交接中，防火墙已由调用方保持在全部断网，这里不撤
+    func shutdown(holdNetwork: Bool = false) {
         loopTask?.cancel()
         heartbeatTask?.cancel()
         core.stop()
-        pf.teardown()
+        if !holdNetwork { pf.teardown() }
         if !dev {
             ipv6Switch.restoreAll()
             dnsLock.restoreAll()
         }
-        log(.info, "守护进程退出，防火墙、系统 DNS 与 IPv6 设置已恢复")
+        log(.info, holdNetwork ? "守护进程退出（升级中）：保持断网，等新版本接管"
+                               : "守护进程退出，防火墙、系统 DNS 与 IPv6 设置已恢复")
         persistEvents(force: true)
     }
 
@@ -216,11 +241,16 @@ actor Guardian {
     }
 
     private func startCore() async {
+        coreTransitions += 1
+        var transitionEnded = false
+        defer { if !transitionEnded { coreTransitions -= 1 } }
         wantCore = true
         lastCoreTransition = Date()
         epoch += 1
-        // 新内核的闸门要重新确认，确认前白名单不放行 TUN
+        // 新内核的闸门要重新确认，确认前白名单不放行 TUN；旧内核的闸门缓存一并作废
         softGatesConfirmed = false
+        gateGeneration += 1
+        appliedGates = [:]
         do {
             try core.writeConfig(buildYAML())
         } catch {
@@ -242,6 +272,8 @@ actor Guardian {
             if await api.version() != nil { apiUp = true; break }
             try? await Task.sleep(for: .milliseconds(150))
         }
+        transitionEnded = true
+        coreTransitions -= 1
         applyProtection()
         await applyGates()
     }
@@ -251,7 +283,7 @@ actor Guardian {
         epoch += 1
         guard wantCore else { return }
         core.noteRestart()
-        log(.warning, "内核意外退出（\(code)），\(Int(restartBackoff)) 秒后重启")
+        log(.warning, "代理内核意外退出（退出码 \(code)），\(Int(restartBackoff)) 秒后自动重启")
         engine.handle(.health(coreUp: false, tunUp: false), now: Date())
         applyProtection()
         nextRestartAt = Date().addingTimeInterval(restartBackoff)
@@ -259,29 +291,41 @@ actor Guardian {
     }
 
     /// 配置相关设置变化后重载；重载失败则整体重启内核
-    private func reloadCore(reason: String) async {
-        guard wantCore else { return }
+    /// 返回 false 表示新配置没能写出，内核仍在用旧规则
+    @discardableResult
+    private func reloadCore(reason: String) async -> Bool {
+        guard wantCore else { return true }
+        coreTransitions += 1
+        var transitionEnded = false
+        defer { if !transitionEnded { coreTransitions -= 1 } }
         epoch += 1
         lastCoreTransition = Date()
         softGatesConfirmed = false
+        gateGeneration += 1
+        appliedGates = [:]
         applyProtection()
         do {
             try core.writeConfig(buildYAML())
         } catch {
             lastError = error.localizedDescription
             log(.critical, "新配置未生效：\(error.localizedDescription)")
-            return
+            configApplyPending = true
+            return false
         }
+        configApplyPending = false
         if core.isRunning, await api.reloadConfig(path: core.configPath) {
-            log(.info, "配置已重载（\(reason)）")
+            log(.info, "代理配置已更新（\(reason)）")
         } else {
-            log(.warning, "热重载失败，重启内核（\(reason)）\(api.lastReloadError.get().map { "：\($0)" } ?? "")")
+            log(.warning, "配置热更新失败，改为重启内核（\(reason)）\(api.lastReloadError.get().map { "：\($0)" } ?? "")")
             core.stop()
             await startCore()
         }
         appliedGates = [:]
         await api.flushConnections()
+        transitionEnded = true
+        coreTransitions -= 1
         await applyGates()
+        return true
     }
 
     // MARK: - 防护执行
@@ -328,6 +372,7 @@ actor Guardian {
         trippedFlag.set(snap.tripped)
         if snap.tripped != lastTripped {
             lastTripped = snap.tripped
+            gateGeneration += 1
             softGatesConfirmed = false
             if snap.tripped {
                 log(.critical, "已熔断：\(snap.reason?.title ?? "")\(snap.hard ? "（全部断网）" : "（只放行大陆白名单）")")
@@ -411,7 +456,13 @@ actor Guardian {
             var stale = false
             for group in desiredGates().keys.sorted() {
                 guard let target = desiredGates()[group], appliedGates[group] != target else { continue }
+                let generation = gateGeneration
                 let ok = await api.select(group: group, proxy: target)
+                // 写入期间内核重启/重载过：结果属于旧内核，不能记账
+                if generation != gateGeneration {
+                    stale = true
+                    continue
+                }
                 if desiredGates()[group] == target {
                     if ok { appliedGates[group] = target }
                 } else {
@@ -423,13 +474,18 @@ actor Guardian {
         }
         // 切换闸门只影响新连接，熔断时必须掐断已有连接
         if flush { await api.flushConnections() }
+        guard softGatesReady() else { return }
+        // 先确认熔断前的连接已全部断开再放行 TUN；await 期间可能又恢复/再熔断，回来后按同一代熔断重新核对
+        let generation = gateGeneration
+        guard await api.flushConnections(), generation == gateGeneration, softGatesReady() else { return }
+        softGatesConfirmed = true
+        applyProtection()
+    }
+
+    private func softGatesReady() -> Bool {
         let snap = engine.snapshot
-        if snap.tripped, !snap.hard, !softGatesConfirmed,
-           appliedGates[GroupName.gateAI] == "REJECT", appliedGates[GroupName.gateMain] == "REJECT" {
-            softGatesConfirmed = true
-            await api.flushConnections()
-            applyProtection()
-        }
+        return snap.tripped && !snap.hard && !softGatesConfirmed && coreTransitions == 0
+            && appliedGates[GroupName.gateAI] == "REJECT" && appliedGates[GroupName.gateMain] == "REJECT"
     }
 
     /// 守护开启时关闭系统 IPv6、锁定系统 DNS；关闭时恢复。开发模式不动系统配置
@@ -477,7 +533,7 @@ actor Guardian {
                 apiUp = false
                 apiFailures += 1
                 if apiFailures >= 5 {
-                    log(.warning, "内核无响应，强制重启")
+                    log(.warning, "代理内核没有响应，已强制重启")
                     apiFailures = 0
                     core.stop()
                     core.noteRestart()
@@ -553,8 +609,11 @@ actor Guardian {
         if let issue = pf.verify() {
             if !anchorWarningShown { log(.critical, issue) }
             anchorWarningShown = true
-        } else {
+            lastError = issue
+        } else if anchorWarningShown {
             anchorWarningShown = false
+            if lastError?.hasPrefix("pf 主规则") == true { lastError = nil }
+            log(.info, "防火墙锚点已恢复生效")
         }
         let mine = Set([core.pid, getpid()].compactMap { $0 })
         let found = ProcessScanner.runningConflicts(excluding: mine)
@@ -627,7 +686,7 @@ actor Guardian {
         // 内核已判定当前节点连不上：不用等心跳超时，直接按失败计。
         // 只用于加快熔断；熔断中必须做真实心跳，否则内核的判断滞后会让恢复永远攒不够成功次数
         if !engine.snapshot.tripped, let leaf = resolved?.leaf, await api.isAlive(leaf) == false {
-            if !nodeDownLogged { log(.critical, "当前节点「\(leaf)」连不上") }
+            if !nodeDownLogged { log(.critical, "当前节点「\(leaf)」无法连接") }
             nodeDownLogged = true
             heartbeatAlive = false
             engine.handle(.probe(ms: nil), now: Date())
@@ -688,7 +747,7 @@ actor Guardian {
         guard !switchingNode, let info = await api.group(GroupName.proxy) else { return }
         switchingNode = true
         defer { switchingNode = false }
-        log(.warning, "出口在 \(RegionNames.name(badCountry))，开始寻找安全节点")
+        log(.warning, "出口落在\(RegionNames.name(badCountry))（禁区），正在寻找出口安全的节点")
         let candidates = Array(info.all.filter { $0 != GroupName.auto && $0 != info.now }.prefix(16))
         var ranked: [(String, Int)] = []
         await withTaskGroup(of: (String, Int?).self) { group in
@@ -714,7 +773,7 @@ actor Guardian {
             }
         }
         await api.select(group: GroupName.proxy, proxy: GroupName.auto)
-        log(.critical, "没有找到出口安全的节点，保持熔断")
+        log(.critical, "没有找到出口安全的节点，继续保持熔断")
     }
 
     // MARK: - 电源与网络
@@ -730,7 +789,7 @@ actor Guardian {
         // 状态机已记录睡眠，硬切断由正常流程接管，解除电源回调里的强制断网
         pf.releaseForcedLockdown()
         applyProtection()
-        log(.info, "系统即将睡眠，已预先断网")
+        log(.info, "系统即将睡眠，已提前断网")
     }
 
     func didWake() async {
@@ -772,8 +831,8 @@ actor Guardian {
         var lastErr: Error = SubscriptionError.empty
         for port in ports {
             do {
-                let (data, resp) = try await fetcher.fetch(url, viaPort: port, timeout: 20,
-                                                           headers: ["User-Agent": Self.subscriptionUA])
+                let (data, resp) = try await fetcher.fetchLimited(url, viaPort: port, timeout: 20, maxBytes: 16 << 20,
+                                                                  headers: ["User-Agent": Self.subscriptionUA])
                 guard resp.statusCode == 200 else { throw SubscriptionError.http(resp.statusCode) }
                 let parsed = try SubscriptionParser.parse(data)
                 let headers = resp.allHeaderFields.reduce(into: [String: String]()) { $0["\($1.key)"] = "\($1.value)" }
@@ -875,7 +934,10 @@ actor Guardian {
         case .getSettings:
             return IPCResponse(settings: settings)
         case .updateSettings(let new):
-            await updateSettings(new)
+            // 设置已落盘但规则没能生效时必须告诉界面，否则用户以为新名单已经在保护
+            if let error = await updateSettings(new) {
+                return IPCResponse(ok: false, error: error, status: snapshotStatus(), settings: settings)
+            }
             return IPCResponse(status: snapshotStatus(), settings: settings)
         case .importSubscription(let url):
             return await importSubscription(url)
@@ -917,7 +979,17 @@ actor Guardian {
             return IPCResponse(controller: ControllerInfo(baseURL: api.base.absoluteString, secret: runtime.secret,
                                                           mixedPort: settings.mixedPort))
         case .events(let after):
-            return IPCResponse(events: events.filter { $0.id > after })
+            // 游标比现有最大编号还大，说明界面拿的是旧编号，返回全部让界面重建
+            let cursor = after >= nextEventID ? 0 : after
+            return IPCResponse(events: events.filter { $0.id > cursor }, eventsGeneration: eventsGeneration)
+        case .clearEvents:
+            // 先确认空列表已落盘再清内存，否则重启后旧事件会回来；编号不回退
+            guard writeEvents([]) else { return .failure("事件记录没能写入磁盘，未清空") }
+            events.removeAll()
+            eventsDirty = false
+            eventsGeneration = UUID().uuidString
+            Log.write("[info] 用户清空了事件记录")
+            return IPCResponse(eventsGeneration: eventsGeneration)
         case .flushConnections:
             await api.flushConnections()
             return IPCResponse()
@@ -930,7 +1002,8 @@ actor Guardian {
         }
     }
 
-    private func updateSettings(_ incoming: GuardSettings) async {
+    /// 返回 nil 表示已生效；否则是给用户看的失败原因（设置本身已保存）
+    private func updateSettings(_ incoming: GuardSettings) async -> String? {
         var new = incoming.sanitized()
         new.subscription = settings.subscription
         let old = settings
@@ -954,17 +1027,22 @@ actor Guardian {
                 engine.handle(.reset, now: Date())
                 applyProtection()
             }
-            return
+            return nil
         }
         applyProtection()
         if old.routing != new.routing { log(.info, new.routing == .smart ? "已切换到智能分流" : "已切换到全局代理") }
         // 分流方式只影响大陆闸门，不需要重载配置
         let configChanged = old.mode != new.mode || old.directOnlyMainland != new.directOnlyMainland
             || old.disabledAICategories != new.disabledAICategories || old.customAIDomains != new.customAIDomains
-            || old.customDirectDomains != new.customDirectDomains || old.mixedPort != new.mixedPort
+            || old.customDirectDomains != new.customDirectDomains || old.customProxyDomains != new.customProxyDomains
+            || old.mixedPort != new.mixedPort
             || old.forbiddenRegions != new.forbiddenRegions
-        if configChanged { await reloadCore(reason: "设置变更") }
+        var failure: String?
+        if configChanged || configApplyPending, !(await reloadCore(reason: "设置变更")) {
+            failure = "设置已保存，但新规则没能生效（\(lastError ?? "配置写入失败")），内核仍按旧规则运行"
+        }
         await applyGates()
+        return failure
     }
 
     // MARK: - 状态与持久化
@@ -979,6 +1057,8 @@ actor Guardian {
         if !settings.enabled { s.phase = .disabled }
         else if snap.tripped { s.phase = .tripped }
         else if !apiUp { s.phase = wantCore ? .starting : .error }
+        // 防火墙层加载失败或锚点失效时只剩内核闸门一层，不能显示「已受保护」
+        else if pfFailing || anchorWarningShown { s.phase = .error }
         else { s.phase = .protected }
         s.effectiveMode = effectiveMode
         s.routing = settings.routing
@@ -1023,9 +1103,21 @@ actor Guardian {
     }
 
     private func persistEvents(force: Bool = false) {
-        guard eventsDirty || force, let data = try? JSONEncoder.iso.encode(events) else { return }
-        eventsDirty = false
-        FileManager.default.createFile(atPath: paths.eventsFile, contents: data, attributes: [.posixPermissions: 0o600])
+        guard eventsDirty || force else { return }
+        // 写失败就保留脏标记，下一轮再试
+        if writeEvents(events) { eventsDirty = false }
+    }
+
+    /// 先写临时文件再改名，避免写一半断电留下损坏的事件文件
+    private func writeEvents(_ list: [GuardEvent]) -> Bool {
+        guard let data = try? JSONEncoder.iso.encode(list) else { return false }
+        let tmp = paths.eventsFile + ".tmp"
+        guard FileManager.default.createFile(atPath: tmp, contents: data, attributes: [.posixPermissions: 0o600]),
+              rename(tmp, paths.eventsFile) == 0 else {
+            unlink(tmp)
+            return false
+        }
+        return true
     }
 }
 

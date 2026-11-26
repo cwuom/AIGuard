@@ -11,7 +11,18 @@ public enum AIGuardPaths {
     public static let launchDaemonPlist = "/Library/LaunchDaemons/com.aiguard.daemon.plist"
 }
 
-public let AIGuardVersion = "1.2.0"
+public let AIGuardVersion = "1.2.1"
+
+/// 按数字逐段比较版本号（"1.10.0" > "1.9.2"），非数字段按 0 处理
+public func compareVersions(_ a: String, _ b: String) -> ComparisonResult {
+    let x = a.split(separator: ".").map { Int($0) ?? 0 }
+    let y = b.split(separator: ".").map { Int($0) ?? 0 }
+    for i in 0..<max(x.count, y.count) {
+        let l = i < x.count ? x[i] : 0, r = i < y.count ? y[i] : 0
+        if l != r { return l < r ? .orderedAscending : .orderedDescending }
+    }
+    return .orderedSame
+}
 
 public enum GuardPhase: String, Codable, Sendable {
     case disabled
@@ -120,6 +131,7 @@ public enum IPCRequest: Codable, Sendable {
     case events(after: Int)
     case flushConnections
     case restartCore
+    case clearEvents
 }
 
 public struct IPCResponse: Codable, Sendable {
@@ -129,15 +141,18 @@ public struct IPCResponse: Codable, Sendable {
     public var settings: GuardSettings?
     public var controller: ControllerInfo?
     public var events: [GuardEvent]?
+    /// 事件列表代号：变化说明守护进程重启或清空过，旧的增量游标作废
+    public var eventsGeneration: String?
 
     public init(ok: Bool = true, error: String? = nil, status: GuardStatus? = nil, settings: GuardSettings? = nil,
-                controller: ControllerInfo? = nil, events: [GuardEvent]? = nil) {
+                controller: ControllerInfo? = nil, events: [GuardEvent]? = nil, eventsGeneration: String? = nil) {
         self.ok = ok
         self.error = error
         self.status = status
         self.settings = settings
         self.controller = controller
         self.events = events
+        self.eventsGeneration = eventsGeneration
     }
 
     public static func failure(_ message: String) -> IPCResponse { IPCResponse(ok: false, error: message) }

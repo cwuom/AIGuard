@@ -53,7 +53,7 @@ struct SubscriptionView: View {
                                 }
                             }
                             if let u = sub.usage, u.total > 0 {
-                                let used = u.upload + u.download
+                                let used = u.used
                                 ProgressView(value: min(Double(used), Double(u.total)), total: Double(u.total)) {
                                     Text("已用 \(Format.bytes(used)) / \(Format.bytes(u.total))").font(.callout)
                                 }

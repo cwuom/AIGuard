@@ -148,6 +148,7 @@ struct TraceAndSettingsTests {
     @Test func oldSettingsFileDecodesWithDefaults() throws {
         let s = try JSONDecoder().decode(GuardSettings.self, from: Data(#"{"mode":"direct","probeIntervalSeconds":1}"#.utf8))
         #expect(s.mode == .direct && s.fuseEnabled && s.routing == .smart)
+        #expect(s.customProxyDomains.isEmpty)
         #expect(s.sanitized().probeIntervalSeconds == 2)
     }
 
@@ -183,5 +184,59 @@ struct TraceAndSettingsTests {
         }
         #expect(url == "https://a.b/c")
         #expect(RegionNames.flag("us") == "🇺🇸")
+        guard case .clearEvents = try IPCCodec.decoder().decode(IPCRequest.self, from: IPCCodec.encoder().encode(IPCRequest.clearEvents))
+        else {
+            Issue.record("clearEvents 解码失败")
+            return
+        }
+        // 旧守护进程的响应没有事件代号，新界面必须照常解码
+        let old = try IPCCodec.decoder().decode(IPCResponse.self, from: Data(#"{"ok":true,"events":[]}"#.utf8))
+        #expect(old.eventsGeneration == nil && old.events == [])
+    }
+
+    @Test func versionOrdering() {
+        #expect(compareVersions("1.2.1", "1.2.0") == .orderedDescending)
+        #expect(compareVersions("1.10.0", "1.9.9") == .orderedDescending)
+        #expect(compareVersions("1.2", "1.2.0") == .orderedSame)
+        #expect(compareVersions("1.2.0", "1.2.1") == .orderedAscending)
+    }
+
+    @Test func usageSumNeverOverflows() {
+        let u = SubscriptionUsage(upload: .max - 1, download: 10, total: 100, expire: nil)
+        #expect(u.used == .max)
+        #expect(SubscriptionUsage(upload: 3, download: 4, total: 10, expire: nil).used == 7)
+    }
+
+    /// 回归：订阅节点在 proxy-provider 里，/proxies 不返回，测速结果必须从 /providers/proxies 合并
+    @Test func providerNodesMergedIntoProxies() {
+        let top = #"{"proxies":{"自动选择":{"type":"Fallback","now":"JP 01","all":["JP 01","US 01"],"history":[{"delay":51}]},"DIRECT":{"type":"Direct","history":[]}}}"#
+        let providers = #"{"providers":{"sub":{"proxies":[{"name":"JP 01","type":"Shadowsocks","history":[{"delay":0},{"delay":88}]},{"name":"US 01","type":"Shadowsocks","history":[{"delay":0}]},{"name":"HK 01","type":"Shadowsocks","history":[]}]},"default":{"proxies":[{"name":"DIRECT","type":"Direct","history":[{"delay":9}]}]}}}"#
+        let map = MihomoAPI.parseProxies(Data(top.utf8), providers: Data(providers.utf8))
+        #expect(map["JP 01"]?.lastDelay == 88 && map["JP 01"]?.tested == true)
+        // 测过但失败：显示超时而不是未测速
+        #expect(map["US 01"]?.lastDelay == nil && map["US 01"]?.tested == true)
+        #expect(map["HK 01"]?.tested == false)
+        #expect(map["自动选择"]?.lastDelay == 51 && map["自动选择"]?.all == ["JP 01", "US 01"])
+        // 顶层同名项以 /proxies 为准
+        #expect(map["DIRECT"]?.tested == false)
+        // 没有 providers 数据时只用 /proxies；有但结构不对时整体作废，不发布半份快照
+        #expect(MihomoAPI.parseProxies(Data(top.utf8), providers: nil).count == 2)
+        #expect(MihomoAPI.parseProxies(Data(top.utf8), providers: Data(#"{"error":"x"}"#.utf8)).isEmpty)
+        #expect(MihomoAPI.parseProxies(Data(top.utf8), providers: Data("not json".utf8)).isEmpty)
+    }
+
+    @Test func connectionRouteKind() {
+        func conn(_ leaf: String) -> MihomoAPI.Connection {
+            MihomoAPI.Connection(id: "1", host: "", destination: "1.1.1.1:443", network: "TCP", chain: leaf, rule: "",
+                                 upload: 0, download: 0, start: nil, leaf: leaf)
+        }
+        #expect(conn("DIRECT").route == .direct)
+        #expect(conn("REJECT").route == .reject)
+        #expect(conn("REJECT-DROP").route == .reject)
+        #expect(conn("🇸🇬新加坡 03").route == .proxy)
+        // 节点名以内置出站名开头也按代理算
+        #expect(conn("DIRECT-HK 备用").route == .proxy)
+        #expect(conn("REJECT 线路").route == .proxy)
+        #expect(conn("").route == .proxy)
     }
 }

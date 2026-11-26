@@ -227,6 +227,16 @@ final class PFController: @unchecked Sendable {
         Shell.run("/sbin/pfctl", ["-a", PFRulesBuilder.legacyUSAnchor, "-F", "all"])
     }
 
+    /// 升级交接：装上全部断网后锁定，进程退出也不撤（不释放 pf 引用），由新版守护进程接管替换
+    func holdLockdownOnExit() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !stopped else { return }
+        forced = true
+        apply(.lockdown)
+        stopped = true
+    }
+
     func teardown() {
         lock.lock()
         defer { lock.unlock() }
@@ -335,15 +345,22 @@ struct ServiceBackup {
         return out
     }
 
-    func write(_ b: [String: String]) {
+    /// 返回是否已落盘。修改系统设置前必须确认备份写成功，否则崩溃后无法恢复用户原来的网络配置
+    @discardableResult
+    func write(_ b: [String: String]) -> Bool {
         if b.isEmpty {
             try? FileManager.default.removeItem(atPath: path)
-            return
+            return !FileManager.default.fileExists(atPath: path)
         }
         let text = b.sorted { $0.key < $1.key }.map { "\($0.key)\t\($0.value)" }.joined(separator: "\n") + "\n"
         let tmp = path + ".tmp"
-        FileManager.default.createFile(atPath: tmp, contents: Data(text.utf8), attributes: [.posixPermissions: 0o600])
-        rename(tmp, path)
+        guard FileManager.default.createFile(atPath: tmp, contents: Data(text.utf8), attributes: [.posixPermissions: 0o600]),
+              rename(tmp, path) == 0 else {
+            Log.write("备份写入失败：\(path)（errno \(errno)）")
+            unlink(tmp)
+            return false
+        }
+        return true
     }
 }
 
@@ -378,7 +395,11 @@ final class SystemDNSLock: @unchecked Sendable {
             if saved[svc] == nil, !cur.hasPrefix("198.18.") { saved[svc] = cur }
             if saved[svc] != nil { targets.append(svc) }
         }
-        backup.write(saved)
+        guard backup.write(saved) else {
+            // 备份没落盘就不改系统 DNS；DNS 防泄漏仍由防火墙兜底
+            lockedCount = 0
+            return
+        }
         var count = 0
         for svc in targets {
             if Shell.run(NetworkServices.tool, ["-setdnsservers", svc, Self.tunDNS]).status == 0 { count += 1 }
@@ -551,7 +572,11 @@ final class SystemIPv6Switch: @unchecked Sendable {
             default: skipped.append(svc)
             }
         }
-        backup.write(saved)
+        guard backup.write(saved) else {
+            // 备份没落盘就不关系统 IPv6，改由防火墙封锁
+            disabledCount = count
+            return skipped + toDisable
+        }
         for svc in toDisable {
             if Shell.run(NetworkServices.tool, ["-setv6off", svc]).status == 0 { count += 1 } else { skipped.append(svc) }
         }

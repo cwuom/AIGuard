@@ -10,9 +10,16 @@ final class GuardStore {
     var status: GuardStatus?
     var settings: GuardSettings?
     var events: [GuardEvent] = []
+    /// 清空事件时加一，丢弃清空前已发出、清空后才返回的增量结果
+    private var eventsEpoch = 0
+    /// 守护进程的事件代号：变了说明它重启或清空过，本地列表和游标作废
+    private var eventsGeneration: String?
     var daemonReachable = false
     /// 连得上但状态格式对不上：已安装的是旧版守护进程
     var daemonOutdated = false
+    /// 已安装的守护进程比界面新：不能提示「升级」，那会用旧版覆盖新版并丢掉新设置
+    var daemonNewer = false
+    var daemonVersion: String?
     var lastIPCError: String?
     var busy: Set<String> = []
     var notice: Notice?
@@ -69,12 +76,16 @@ final class GuardStore {
             // 界面和守护进程版本不一致时一律要求升级，避免新界面操作旧守护进程
             if let v = r.status?.version, v != AIGuardVersion {
                 daemonReachable = false
-                daemonOutdated = true
+                daemonVersion = v
+                daemonNewer = compareVersions(v, AIGuardVersion) == .orderedDescending
+                daemonOutdated = !daemonNewer
                 lastIPCError = "守护进程版本 \(v)"
                 return
             }
             daemonReachable = true
             daemonOutdated = false
+            daemonNewer = false
+            daemonVersion = r.status?.version
             lastIPCError = nil
             if let s = r.status { status = s }
             if settings == nil, case .success(let sr) = await call(.getSettings) { settings = sr.settings }
@@ -83,9 +94,18 @@ final class GuardStore {
                 api = MihomoAPI(base: URL(string: c.baseURL)!, secret: c.secret)
             }
             let after = events.last?.id ?? 0
-            if case .success(let er) = await call(.events(after: after)), let new = er.events, !new.isEmpty {
-                events.append(contentsOf: new)
-                if events.count > 400 { events.removeFirst(events.count - 400) }
+            let epoch = eventsEpoch
+            if case .success(let er) = await call(.events(after: after)), epoch == eventsEpoch {
+                if let gen = er.eventsGeneration, gen != eventsGeneration {
+                    // 代号变了：旧游标可能跳过新一代的低编号事件，清空后下一轮从头拉
+                    let first = eventsGeneration == nil
+                    eventsGeneration = gen
+                    if !first {
+                        events = []
+                        return
+                    }
+                }
+                mergeEvents(er.events ?? [], after: after)
             }
         case .failure(let e):
             daemonReachable = false
@@ -147,7 +167,12 @@ final class GuardStore {
             try? await Task.sleep(for: .seconds(1))
             if case .success(let r) = await call(.status, timeout: 3), let s = r.status { status = s }
             if status?.fuse.tripped == false {
-                notice = Notice(text: "验证通过，网络已恢复", isError: false)
+                // 熔断解除不等于全部正常：防火墙层异常时守护进程报 error，不能说「验证通过」
+                if status?.phase == .protected {
+                    notice = Notice(text: "验证通过，网络已恢复", isError: false)
+                } else {
+                    notice = Notice(text: "熔断已解除，但防护仍有异常：\(status?.lastError ?? "请查看「事件」页")", isError: true)
+                }
                 return
             }
         }
@@ -162,6 +187,35 @@ final class GuardStore {
         _ = await perform("fuse", .restartCore, success: "内核已重启，正在重新验证线路", timeout: 90)
         settings = nil
         await refresh()
+    }
+
+    /// refresh 可能被并发调用（轮询 + 手动刷新），只追加比本地最新编号更大的事件，避免重复
+    private func mergeEvents(_ new: [GuardEvent], after: Int) {
+        guard !new.isEmpty else { return }
+        if let first = new.first, first.id <= after, events.last?.id == after {
+            // 守护进程返回的是完整列表（游标失效），整表替换
+            events = new
+        } else {
+            let last = events.last?.id ?? 0
+            events.append(contentsOf: new.filter { $0.id > last })
+        }
+        if events.count > 400 { events.removeFirst(events.count - 400) }
+    }
+
+    func clearEvents() async {
+        busy.insert("events")
+        defer { busy.remove("events") }
+        switch await call(.clearEvents) {
+        case .success(let r) where r.ok:
+            eventsEpoch += 1
+            eventsGeneration = r.eventsGeneration ?? eventsGeneration
+            events = []
+            notice = Notice(text: "事件记录已清空", isError: false)
+        case .success(let r):
+            notice = Notice(text: r.error ?? "清空失败", isError: true)
+        case .failure(let e):
+            notice = Notice(text: "无法连接守护进程：\(e.localizedDescription)", isError: true)
+        }
     }
 
     func captiveLogin() async { _ = await perform("captive", .captiveLogin(minutes: 5), success: "5 分钟内直连，请在浏览器完成 Wi-Fi 登录") }
@@ -186,12 +240,21 @@ final class GuardStore {
         }
     }
 
+    /// 全量测速：内核并发测组内每个节点（含「自动选择」当前线路），结果写进各节点的历史
     func testGroup(_ group: String) async {
         guard let api else { return }
         testingGroup = group
         defer { testingGroup = nil }
-        _ = await api.groupDelay(group, url: "http://cp.cloudflare.com/generate_204", timeoutMs: 4000)
+        let total = proxies[group]?.all.count ?? 0
+        guard let result = await api.groupDelay(group, url: "http://cp.cloudflare.com/generate_204", timeoutMs: 5000) else {
+            notice = Notice(text: "测速请求失败，内核没有响应，请稍后重试", isError: true)
+            return
+        }
         await loadProxies()
+        if total > 0 {
+            let ok = result.values.filter { $0 > 0 }.count
+            notice = Notice(text: "测速完成：\(ok)/\(total) 个可用", isError: ok == 0)
+        }
     }
 
     // MARK: - 连接

@@ -5,6 +5,7 @@ struct RulesView: View {
     @Environment(GuardStore.self) private var store
     @State private var newAI = ""
     @State private var newDirect = ""
+    @State private var newProxy = ""
     @State private var expanded: Set<String> = []
 
     var body: some View {
@@ -34,7 +35,12 @@ struct RulesView: View {
                                  items: s.customAIDomains, input: $newAI) { list in
                         store.updateSettings { $0.customAIDomains = list }
                     }
-                    DomainEditor(title: "强制直连域名", subtitle: "公司内网、国内服务等（AI 规则优先，写在这里也不会让 AI 直连）",
+                    DomainEditor(title: "强制走代理域名",
+                                 subtitle: "大陆名单偶尔会误收境外网站，导致它们直连、看到你的真实 IP。把这类网站加在这里，智能分流下也一律走代理，DNS 同样经代理解析。已内置 \(ForceProxyCatalog.suffixes.count) 个 IP 与泄漏检测站点（如 browserleaks.com）。",
+                                 items: s.customProxyDomains, input: $newProxy) { list in
+                        store.updateSettings { $0.customProxyDomains = list }
+                    }
+                    DomainEditor(title: "强制直连域名", subtitle: "公司内网、国内服务等。AI 规则优先，写在这里也不会让 AI 直连；与「强制走代理」重复时以直连为准。",
                                  items: s.customDirectDomains, input: $newDirect) { list in
                         store.updateSettings { $0.customDirectDomains = list }
                     }

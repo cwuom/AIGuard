@@ -34,6 +34,22 @@ public enum BundledRuleSets {
     public static var files: [String] { all.map(\.file) }
 }
 
+/// 智能分流下也必须走代理的站点。上游 geosite:cn 是 11 万条的社区名单，混有境外站点
+/// （例如 browserleaks.com、whatismyip.com），命中后会直连并暴露大陆 IP。
+/// 这里收录 IP / DNS / WebRTC 泄漏检测与指纹检测站：用户正是靠它们确认自己没有泄漏
+public enum ForceProxyCatalog {
+    public static let suffixes = [
+        "browserleaks.com", "browserleaks.net", "browserleaks.org", "ipleak.net", "ipleak.org", "dnsleaktest.com",
+        "dnsleak.com", "bash.ws", "whoer.net", "whoer.com", "ipinfo.io", "ip.sb", "ipify.org", "ifconfig.me",
+        "ifconfig.co", "icanhazip.com", "ipapi.co", "ip-api.com", "ipdata.co", "ipapi.is", "ipregistry.co",
+        "iplocation.net", "whatismyipaddress.com", "whatismyip.com", "whatismybrowser.com", "myip.com",
+        "browserscan.net", "pixelscan.net", "iphey.com", "scamalytics.com", "ipqualityscore.com", "ipwho.is",
+        "db-ip.com", "ip2location.com", "ip2location.io", "ipgeolocation.io", "maxmind.com", "ipwhois.io",
+        "ipcheck.ing", "ippure.com", "test-ipv6.com", "ipv6-test.com", "fingerprint.com", "amiunique.org",
+        "coveryourtracks.eff.org",
+    ]
+}
+
 public enum AIRuleCatalog {
     public static let all: [AIRuleCategory] = [
         AIRuleCategory(

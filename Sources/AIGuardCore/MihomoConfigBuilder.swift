@@ -66,6 +66,15 @@ public enum MihomoConfigBuilder {
     static let domesticDoH = ["https://223.5.5.5/dns-query", "https://1.12.12.12/dns-query"]
     static let foreignDoH = ["https://1.1.1.1/dns-query#\(GroupName.proxy)", "https://8.8.8.8/dns-query#\(GroupName.proxy)"]
 
+    /// 智能分流下强制走代理的域名：内置检测站 + 用户名单。
+    /// 用户直连名单的规则排在前面，被它（本身或父域）覆盖的域名路由上本来就直连，DNS 也不能再给它走代理
+    public static func forceProxyDomains(_ s: GuardSettings) -> [String] {
+        let direct = DomainSanitizer.clean(s.customDirectDomains)
+        return DomainSanitizer.clean(ForceProxyCatalog.suffixes + s.customProxyDomains).filter { d in
+            !direct.contains { d == $0 || d.hasSuffix("." + $0) }
+        }
+    }
+
     public static func effectiveMode(_ settings: GuardSettings, _ rt: CoreRuntime) -> ProxyMode {
         rt.hasSubscription ? settings.mode : .direct
     }
@@ -134,6 +143,15 @@ public enum MihomoConfigBuilder {
             // 境外域名经代理走 DoH，ISP 看不到查询；大陆域名用国内 DoH
             y.list("  nameserver", foreignDoH)
             y.line("  nameserver-policy:")
+            // 按书写顺序取第一个匹配，顺序与分流规则一致：用户直连 > 强制代理 > 大陆名单。
+            // 直连的域名用国内 DoH，不依赖代理，也不会被父域的强制代理策略带走
+            for d in s.customDirectDomains {
+                y.line("    \(q("+." + d)): [\(domesticDoH.map(q).joined(separator: ", "))]")
+            }
+            // 强制代理的域名必须排在大陆名单前面，否则会被国内 DoH 解析
+            for d in forceProxyDomains(s) {
+                y.line("    \(q("+." + d)): [\(foreignDoH.map(q).joined(separator: ", "))]")
+            }
             y.line("    \(q("rule-set:cn-site")): [\(domesticDoH.map(q).joined(separator: ", "))]")
         } else if captive, let iface = captiveInterface, iface.range(of: "^en[0-9]{1,3}$", options: .regularExpression) != nil {
             // 酒店认证页通常只能用 DHCP 下发的 DNS 解析
@@ -210,13 +228,16 @@ public enum MihomoConfigBuilder {
 
         switch mode {
         case .direct where s.directOnlyMainland && !captive:
-            // 只放行大陆：名单之外的 AI 服务也到不了
+            // 只放行大陆：名单之外的 AI 服务也到不了。大陆名单误收的境外站点在它之前拒绝
+            for d in forceProxyDomains(s) { r.append("DOMAIN-SUFFIX,\(d),REJECT") }
             r.append("RULE-SET,cn-site,\(GroupName.gateDirect)")
             r.append("RULE-SET,cn-ip,\(GroupName.gateDirect)")
             r.append("MATCH,REJECT")
         case .direct:
             r.append("MATCH,\(GroupName.gateDirect)")
         case .proxy:
+            // 大陆名单会误收境外站点，强制代理的域名必须排在它前面；走主闸门，熔断时一并拒绝
+            for d in forceProxyDomains(s) { r.append("DOMAIN-SUFFIX,\(d),\(GroupName.gateMain)") }
             // 智能/全局的区别由大陆闸门决定，切换分流方式不需要重载配置
             r.append("RULE-SET,cn-site,\(GroupName.gateCN)")
             r.append("RULE-SET,cn-ip,\(GroupName.gateCN)")

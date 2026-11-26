@@ -33,6 +33,11 @@ if [[ "$APP_SRC" == *.app && "$APP_SRC" != "/Applications/AIGuard.app" ]]; then
 fi
 
 echo "==> 停止旧版守护进程"
+# 升级保持：旧版守护进程（1.2.1 起）看到这个标记会在退出时保留断网规则，
+# 新版接管前应用无法绕过代理直连；无论成功失败，脚本结束都删掉标记
+HOLD="/Library/Application Support/AIGuard/upgrade-hold"
+trap 'rm -f "$HOLD"' EXIT
+if [[ -d "${HOLD:h}" ]]; then touch "$HOLD"; fi
 launchctl bootout "system/$LABEL" 2>/dev/null || true
 for _ in {1..50}; do [[ -S "$SOCKET" ]] || break; sleep 0.1; done
 
@@ -75,6 +80,6 @@ for _ in {1..100}; do [[ -S "$SOCKET" ]] && break; sleep 0.1; done
 if [[ -S "$SOCKET" ]]; then
   echo "✅ 安装完成：$("$HELPER/aiguardd" --version)"
 else
-  echo "⚠️ 守护进程未就绪，查看 /Library/Logs/AIGuard/daemon.log" >&2
+  echo "⚠️ 守护进程未就绪，网络保持阻断。查看 /Library/Logs/AIGuard/daemon.log；需要先恢复上网可运行 sudo $RES/uninstall.sh" >&2
   exit 1
 fi

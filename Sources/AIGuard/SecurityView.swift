@@ -150,38 +150,203 @@ private struct RegionEditor: View {
 
 struct EventsView: View {
     @Environment(GuardStore.self) private var store
-    @State private var onlyImportant = false
+    @State private var level: EventFilter = .all
+    @State private var search = ""
+    @State private var confirmClear = false
+
+    private var filtered: [GuardEvent] {
+        store.events.reversed().filter { e in
+            level.includes(e.level) && (search.isEmpty || e.message.localizedCaseInsensitiveContains(search))
+        }
+    }
 
     var body: some View {
-        let list = store.events.reversed().filter { !onlyImportant || $0.level != .info }
-        List(list) { e in
-            HStack(alignment: .top, spacing: 10) {
-                Image(systemName: icon(e.level)).foregroundStyle(color(e.level)).frame(width: 18)
-                    .accessibilityLabel(e.level.rawValue)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(e.message).textSelection(.enabled)
-                    Text(e.at.formatted(date: .abbreviated, time: .standard)).font(.caption).foregroundStyle(.secondary)
+        let list = filtered
+        let sections = Self.groupByDay(list)
+        VStack(alignment: .leading, spacing: 14) {
+            header(shown: list.count)
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 18, pinnedViews: []) {
+                    ForEach(sections, id: \.day) { section in
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(Self.dayTitle(section.day)).font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
+                                .accessibilityAddTraits(.isHeader)
+                            // 同一天的事件放在一张卡片里，用分隔线区分，避免满屏玻璃块
+                            VStack(spacing: 0) {
+                                ForEach(Array(section.events.enumerated()), id: \.element.id) { i, e in
+                                    if i > 0 { Divider().opacity(0.5).padding(.leading, 44) }
+                                    EventRow(event: e)
+                                }
+                            }
+                            .glassEffect(.regular, in: .rect(cornerRadius: 16))
+                        }
+                    }
+                }
+                .padding(.bottom, 24)
+            }
+            .overlay {
+                if list.isEmpty { emptyState }
+            }
+        }
+        .padding([.horizontal, .top], 24)
+        .navigationTitle("事件")
+        .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
+        .searchable(text: $search, placement: .toolbar, prompt: "搜索事件内容")
+        .confirmationDialog("清空全部 \(store.events.count) 条事件记录？", isPresented: $confirmClear) {
+            Button("清空", role: .destructive) { Task { await store.clearEvents() } }
+        } message: {
+            Text("事件页和守护进程保存的事件列表会一起清空，无法恢复；/Library/Logs/AIGuard 下的运行日志不受影响。之后的新事件会照常记录。")
+        }
+    }
+
+    private func header(shown: Int) -> some View {
+        let warn = store.events.filter { $0.level == .warning }.count
+        let crit = store.events.filter { $0.level == .critical }.count
+        return HStack(spacing: 12) {
+            Picker("级别", selection: $level) {
+                ForEach(EventFilter.allCases) { Text($0.title).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .fixedSize()
+            Text("共 \(store.events.count) 条 · 警告 \(warn) · 严重 \(crit)\(shown != store.events.count ? " · 当前显示 \(shown)" : "")")
+                .font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+            Spacer(minLength: 0)
+            GlassEffectContainer(spacing: 8) {
+                HStack(spacing: 8) {
+                    Button {
+                        copy(filtered)
+                    } label: { Label("复制", systemImage: "doc.on.doc") }
+                        .buttonStyle(.glass)
+                        .disabled(shown == 0)
+                        .help("复制当前显示的事件，方便反馈问题")
+                    Button(role: .destructive) { confirmClear = true } label: {
+                        Label("清空", systemImage: "trash")
+                    }
+                    .buttonStyle(.glass)
+                    .disabled(store.events.isEmpty || store.busy.contains("events"))
                 }
             }
-            .padding(.vertical, 2)
         }
-        .scrollContentBackground(.hidden)
-        .navigationTitle("事件")
-        .toolbar {
-            Toggle("只看警告", isOn: $onlyImportant).toggleStyle(.button)
-        }
-        .overlay { if list.isEmpty { ContentUnavailableView("暂无事件", systemImage: "list.bullet.rectangle") } }
     }
 
-    private func icon(_ l: EventLevel) -> String {
+    @ViewBuilder private var emptyState: some View {
+        if store.events.isEmpty {
+            ContentUnavailableView {
+                Label("还没有事件", systemImage: "checkmark.seal")
+            } description: {
+                Text("熔断与恢复、节点切换、出口变化、订阅更新等都会记在这里。")
+            }
+        } else {
+            ContentUnavailableView {
+                Label("没有符合条件的事件", systemImage: "line.3.horizontal.decrease.circle")
+            } description: {
+                Text("换个关键词，或把级别切回「全部」。")
+            }
+        }
+    }
+
+    private func copy(_ list: [GuardEvent]) {
+        let text = list.map { "\($0.at.formatted(date: .numeric, time: .standard)) [\(EventRow.levelTitle($0.level))] \($0.message)" }
+            .joined(separator: "\n")
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        store.notice = .init(text: "已复制 \(list.count) 条事件", isError: false)
+    }
+
+    struct DaySection {
+        var day: Date
+        var events: [GuardEvent]
+    }
+
+    /// 输入已按时间倒序，保持顺序按自然日分组
+    static func groupByDay(_ list: [GuardEvent]) -> [DaySection] {
+        let cal = Calendar.current
+        var out: [DaySection] = []
+        for e in list {
+            let day = cal.startOfDay(for: e.at)
+            if out.last?.day == day { out[out.count - 1].events.append(e) } else { out.append(DaySection(day: day, events: [e])) }
+        }
+        return out
+    }
+
+    static func dayTitle(_ day: Date) -> String {
+        let cal = Calendar.current
+        if cal.isDateInToday(day) { return "今天" }
+        if cal.isDateInYesterday(day) { return "昨天" }
+        return day.formatted(.dateTime.month().day().weekday(.wide))
+    }
+}
+
+private enum EventFilter: String, CaseIterable, Identifiable {
+    case all, warnings, critical
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .all: return "全部"
+        case .warnings: return "警告及以上"
+        case .critical: return "仅严重"
+        }
+    }
+    func includes(_ l: EventLevel) -> Bool {
+        switch self {
+        case .all: return true
+        case .warnings: return l != .info
+        case .critical: return l == .critical
+        }
+    }
+}
+
+private struct EventRow: View {
+    var event: GuardEvent
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Image(systemName: Self.icon(event.level))
+                .foregroundStyle(Self.color(event.level))
+                .frame(width: 18)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(event.message).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                if event.level != .info {
+                    Text(Self.levelTitle(event.level)).font(.caption2.weight(.bold)).foregroundStyle(Self.color(event.level))
+                }
+            }
+            Spacer(minLength: 8)
+            Text(event.at.formatted(date: .omitted, time: .standard))
+                .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(.rect)
+        .contextMenu {
+            Button("复制这条事件") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(event.message, forType: .string)
+            }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(Self.levelTitle(event.level))，\(event.message)，\(event.at.formatted(date: .abbreviated, time: .standard))")
+    }
+
+    static func levelTitle(_ l: EventLevel) -> String {
+        switch l {
+        case .info: return "信息"
+        case .warning: return "警告"
+        case .critical: return "严重"
+        }
+    }
+
+    static func icon(_ l: EventLevel) -> String {
         switch l {
         case .info: return "info.circle"
-        case .warning: return "exclamationmark.triangle"
-        case .critical: return "bolt.shield"
+        case .warning: return "exclamationmark.triangle.fill"
+        case .critical: return "bolt.shield.fill"
         }
     }
 
-    private func color(_ l: EventLevel) -> Color {
+    static func color(_ l: EventLevel) -> Color {
         switch l {
         case .info: return .secondary
         case .warning: return Palette.caution

@@ -116,29 +116,53 @@ public final class MihomoAPI: Sendable {
         public var all: [String]
         public var lastDelay: Int?
         public var alive: Bool
+        /// 测过至少一次；配合 lastDelay == nil 区分「超时」和「未测速」
+        public var tested: Bool
     }
 
-    /// 全部节点与策略组（界面列表用）
+    /// 全部节点与策略组（界面列表用）。订阅节点来自 proxy-provider，/proxies 里没有，
+    /// 必须再合并 /providers/proxies，否则测速结果永远显示不出来
+    /// 两个接口任一失败都返回空，调用方保留上一份完整快照，避免节点延迟被半份结果抹掉
     public func proxies() async -> [String: ProxyItem] {
         guard let (data, code) = try? await request("/proxies"), code == 200,
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let (pd, pc) = try? await request("/providers/proxies"), pc == 200 else { return [:] }
+        return Self.parseProxies(data, providers: pd)
+    }
+
+    /// providers 不为 nil 却解析不出结构时整体返回空：半份快照会抹掉订阅节点的测速结果
+    static func parseProxies(_ data: Data, providers: Data?) -> [String: ProxyItem] {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let map = obj["proxies"] as? [String: [String: Any]] else { return [:] }
         var out: [String: ProxyItem] = [:]
-        for (name, p) in map {
-            let history = p["history"] as? [[String: Any]] ?? []
-            let last = (history.last?["delay"] as? Int).flatMap { $0 > 0 ? $0 : nil }
-            out[name] = ProxyItem(name: name, type: p["type"] as? String ?? "", now: p["now"] as? String,
-                                  all: p["all"] as? [String] ?? [], lastDelay: last, alive: p["alive"] as? Bool ?? true)
+        for (name, p) in map { out[name] = item(name: name, p) }
+        if let providers {
+            guard let pobj = try? JSONSerialization.jsonObject(with: providers) as? [String: Any],
+                  let pmap = pobj["providers"] as? [String: [String: Any]] else { return [:] }
+            for (_, prov) in pmap {
+                for p in prov["proxies"] as? [[String: Any]] ?? [] {
+                    // 顶层同名项（策略组、DIRECT 等）以 /proxies 为准
+                    guard let name = p["name"] as? String, out[name] == nil else { continue }
+                    out[name] = item(name: name, p)
+                }
+            }
         }
         return out
     }
 
-    /// 并发测速整个策略组，返回 节点名 → 延迟
-    public func groupDelay(_ name: String, url: String, timeoutMs: Int) async -> [String: Int] {
+    private static func item(name: String, _ p: [String: Any]) -> ProxyItem {
+        let history = p["history"] as? [[String: Any]] ?? []
+        let last = (history.last?["delay"] as? Int).flatMap { $0 > 0 ? $0 : nil }
+        return ProxyItem(name: name, type: p["type"] as? String ?? "", now: p["now"] as? String,
+                         all: p["all"] as? [String] ?? [], lastDelay: last, alive: p["alive"] as? Bool ?? true,
+                         tested: !history.isEmpty)
+    }
+
+    /// 并发测速整个策略组，返回 节点名 → 延迟（只含成功的节点）；请求本身失败返回 nil
+    public func groupDelay(_ name: String, url: String, timeoutMs: Int) async -> [String: Int]? {
         let q = [URLQueryItem(name: "url", value: url), URLQueryItem(name: "timeout", value: String(timeoutMs))]
         guard let (data, code) = try? await request("/group/\(Self.seg(name))/delay", query: q,
                                                      timeout: TimeInterval(timeoutMs) / 1000 + 10),
-              code == 200, let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Int] else { return [:] }
+              code == 200, let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Int] else { return nil }
         return obj
     }
 
@@ -183,6 +207,19 @@ public final class MihomoAPI: Sendable {
         public var upload: Int64
         public var download: Int64
         public var start: Date?
+        /// 链路实际出口（内核 chains 数组的第一项），节点名本身可能含「→」，不能从 chain 文本里切
+        public var leaf: String
+
+        public enum RouteKind: Sendable { case proxy, direct, reject }
+
+        /// 只认内置出站的精确名字，节点名以 REJECT/DIRECT 开头也按代理算
+        public var route: RouteKind {
+            switch leaf {
+            case "DIRECT": return .direct
+            case "REJECT", "REJECT-DROP": return .reject
+            default: return .proxy
+            }
+        }
     }
 
     public struct ConnectionsSnapshot: Sendable, Equatable {
@@ -206,7 +243,8 @@ public final class MihomoAPI: Sendable {
             let m = c["metadata"] as? [String: Any] ?? [:]
             let host = (m["host"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? (m["sniffHost"] as? String) ?? ""
             let dst = "\(m["destinationIP"] as? String ?? ""):\(m["destinationPort"] as? String ?? "")"
-            let chains = (c["chains"] as? [String] ?? []).filter { !$0.hasPrefix(GroupName.internalPrefix) }
+            let rawChains = c["chains"] as? [String] ?? []
+            let chains = rawChains.filter { !$0.hasPrefix(GroupName.internalPrefix) }
             let rule = [c["rule"] as? String, c["rulePayload"] as? String].compactMap { $0 }.filter { !$0.isEmpty }
                 .joined(separator: " · ")
             let start = (c["start"] as? String).flatMap { s -> Date? in
@@ -218,7 +256,8 @@ public final class MihomoAPI: Sendable {
                               network: (m["network"] as? String ?? "").uppercased(),
                               chain: chains.reversed().joined(separator: " → "), rule: rule,
                               upload: (c["upload"] as? NSNumber)?.int64Value ?? 0,
-                              download: (c["download"] as? NSNumber)?.int64Value ?? 0, start: start)
+                              download: (c["download"] as? NSNumber)?.int64Value ?? 0, start: start,
+                              leaf: rawChains.first ?? "")
         }
         return ConnectionsSnapshot(connections: list,
                                    uploadTotal: (obj["uploadTotal"] as? NSNumber)?.int64Value ?? 0,
@@ -244,8 +283,11 @@ public final class MihomoAPI: Sendable {
         return answers.compactMap { ($0["type"] as? Int) == 1 ? $0["data"] as? String : nil }
     }
 
-    public func flushConnections() async {
-        _ = try? await request("/connections", method: "DELETE")
+    /// 返回内核是否确认已断开全部连接
+    @discardableResult
+    public func flushConnections() async -> Bool {
+        guard let (_, code) = try? await request("/connections", method: "DELETE") else { return false }
+        return code == 204 || code == 200
     }
 }
 
@@ -323,6 +365,22 @@ public final class ProxiedFetcher: NSObject, URLSessionTaskDelegate, @unchecked 
         for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
         let (data, resp) = try await session(port: port).data(for: req)
         guard let http = resp as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        return (data, http)
+    }
+
+    /// 带大小上限的下载（订阅用）：守护进程以 root 常驻，不能被超大响应撑爆内存
+    public func fetchLimited(_ url: URL, viaPort port: Int?, timeout: TimeInterval, maxBytes: Int,
+                             headers: [String: String] = [:]) async throws -> (Data, HTTPURLResponse) {
+        var req = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: timeout)
+        for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
+        let (bytes, resp) = try await session(port: port).bytes(for: req)
+        guard let http = resp as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        if http.expectedContentLength > Int64(maxBytes) { throw URLError(.dataLengthExceedsMaximum) }
+        var data = Data()
+        for try await byte in bytes {
+            data.append(byte)
+            if data.count > maxBytes { throw URLError(.dataLengthExceedsMaximum) }
+        }
         return (data, http)
     }
 

@@ -65,6 +65,14 @@ struct MihomoIntegrationTests {
         let d = await api.delay(GroupName.proxy, url: "http://cp.cloudflare.com/generate_204", timeoutMs: 5000)
         #expect(d != nil, "延迟探测失败")
 
+        // 全量测速：订阅节点在 provider 里，测完必须能从 proxies() 读到它们各自的结果
+        let tested = try #require(await api.groupDelay(GroupName.proxy, url: "http://cp.cloudflare.com/generate_204", timeoutMs: 5000))
+        #expect(tested["🇯🇵 JP 01"] != nil && tested["🇺🇸 US 01"] != nil)
+        #expect(await api.groupDelay("不存在的组", url: "http://cp.cloudflare.com/generate_204", timeoutMs: 1000) == nil)
+        let all = await api.proxies()
+        #expect(all["🇯🇵 JP 01"]?.tested == true && all["🇯🇵 JP 01"]?.lastDelay != nil, "provider 节点的测速结果没有合并进来")
+        #expect(all["🇺🇸 US 01"]?.lastDelay != nil)
+
         // 闸门 REJECT 时普通入站访问失败；放行后恢复
         let plain = ProxiedFetcher(user: "", password: "")
         let probe = URL(string: "http://cp.cloudflare.com/generate_204")!
@@ -75,6 +83,17 @@ struct MihomoIntegrationTests {
         let passed = try await plain.fetch(probe, viaPort: base + 4, timeout: 8)
         #expect(passed.1.statusCode == 204)
 
+        // 回归：browserleaks.com 被 geosite:cn 误收，必须仍经主闸门走代理，不能命中大陆名单直连
+        let leakTask = Task { _ = try? await plain.fetch(URL(string: "https://browserleaks.com/ip")!, viaPort: base + 4, timeout: 8) }
+        var leakConn: MihomoAPI.Connection?
+        for _ in 0..<60 where leakConn == nil {
+            leakConn = await api.connections()?.connections.first { $0.host == "browserleaks.com" }
+            if leakConn == nil { try await Task.sleep(for: .milliseconds(50)) }
+        }
+        leakTask.cancel()
+        let lc = try #require(leakConn, "没有捕获到 browserleaks.com 的连接")
+        #expect(lc.route == .proxy && !lc.rule.contains("cn-site"), "browserleaks.com 走了 \(lc.chain)（\(lc.rule)）")
+
         // 探测入站必须认证：错误密码拿不到结果，正确密码能查到出口
         let wrong = ProxiedFetcher(user: "aiguard", password: "nope")
         let denied = try? await wrong.fetch(probe, viaPort: base + 1, timeout: 5)
@@ -82,6 +101,14 @@ struct MihomoIntegrationTests {
         let good = ProxiedFetcher(user: "aiguard", password: "it-pass")
         let trace = await good.heartbeat(viaPort: base + 1, timeout: 8)
         #expect(trace != nil, "经探测入站的长连接心跳失败")
+        // 订阅下载走带上限的流式读取，经认证入站同样可用；超过上限必须报错而不是整包读进内存
+        let limited = try await good.fetchLimited(URL(string: "https://www.cloudflare.com/cdn-cgi/trace")!, viaPort: base + 1,
+                                                  timeout: 8, maxBytes: 1 << 20)
+        #expect(limited.1.statusCode == 200 && !limited.0.isEmpty)
+        await #expect(throws: URLError.self) {
+            _ = try await good.fetchLimited(URL(string: "https://www.cloudflare.com/cdn-cgi/trace")!, viaPort: base + 1,
+                                            timeout: 8, maxBytes: 16)
+        }
         #expect(trace?.country.count == 2)
     }
 }

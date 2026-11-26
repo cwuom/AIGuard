@@ -82,6 +82,69 @@ struct ConfigBuilderTests {
         #expect(rules.contains("DOMAIN-SUFFIX,corp.internal.cn,\(GroupName.gateDirect)"))
     }
 
+    /// 回归：geosite:cn 误收了 browserleaks.com，智能分流下检测站直连、暴露了大陆 IP
+    @Test func forceProxySitesBeatMainlandList() {
+        var s = GuardSettings()
+        s.customProxyDomains = ["HTTPS://Leak.Example.org/x", "both.example.com"]
+        s.customDirectDomains = ["both.example.com"]
+        let rules = MihomoConfigBuilder.rules(settings: s.sanitized(), mode: .proxy)
+        let cn = rules.firstIndex(of: "RULE-SET,cn-site,\(GroupName.gateCN)")!
+        for d in ["browserleaks.com", "whatismyip.com", "leak.example.org"] {
+            let i = rules.firstIndex(of: "DOMAIN-SUFFIX,\(d),\(GroupName.gateMain)")
+            #expect(i != nil && i! < cn, "\(d) 必须在大陆名单之前强制走代理")
+        }
+        // 用户明确要求直连的以直连为准
+        #expect(rules.contains("DOMAIN-SUFFIX,both.example.com,\(GroupName.gateDirect)"))
+        #expect(!rules.contains("DOMAIN-SUFFIX,both.example.com,\(GroupName.gateMain)"))
+        // AI 规则仍然最先
+        let ai = rules.firstIndex(of: "DOMAIN-SUFFIX,claude.ai,\(GroupName.gateAI)")!
+        #expect(ai < rules.firstIndex(of: "DOMAIN-SUFFIX,browserleaks.com,\(GroupName.gateMain)")!)
+        // 直连「只放行大陆」时这些境外站点必须在大陆名单之前拒绝；不限大陆或 Wi-Fi 登录时不生成
+        let strict = MihomoConfigBuilder.rules(settings: s.sanitized(), mode: .direct)
+        let strictCN = strict.firstIndex(of: "RULE-SET,cn-site,\(GroupName.gateDirect)")!
+        let reject = strict.firstIndex(of: "DOMAIN-SUFFIX,browserleaks.com,REJECT")
+        #expect(reject != nil && reject! < strictCN)
+        #expect(!MihomoConfigBuilder.rules(settings: s.sanitized(), mode: .direct, captive: true).contains { $0.contains("browserleaks") })
+        var loose = s
+        loose.directOnlyMainland = false
+        #expect(!MihomoConfigBuilder.rules(settings: loose.sanitized(), mode: .direct).contains { $0.contains("browserleaks") })
+
+        // DNS 同理：nameserver-policy 按书写顺序取第一个匹配，检测站必须先于大陆名单、走境外 DoH
+        let yaml = MihomoConfigBuilder.build(settings: s, runtime: runtime)
+        let leak = yaml.range(of: "\"+.browserleaks.com\": [\"https://1.1.1.1/dns-query#\(GroupName.proxy)\"")
+        let cnPolicy = yaml.range(of: "\"rule-set:cn-site\": [\"https://223.5.5.5")
+        #expect(leak != nil && cnPolicy != nil && leak!.lowerBound < cnPolicy!.lowerBound)
+        // 直连优先：既在直连又在强制代理里的域名，DNS 只走国内 DoH
+        #expect(!yaml.contains("\"+.both.example.com\": [\"https://1.1.1.1"))
+        #expect(yaml.contains("\"+.both.example.com\": [\"https://223.5.5.5"))
+
+        // 父域在直连名单里：子域的强制代理在路由上被直连规则先命中，DNS 也必须一致地不走代理
+        var parent = GuardSettings()
+        parent.customDirectDomains = ["example.net"]
+        parent.customProxyDomains = ["a.example.net", "example.network"]
+        let forced = MihomoConfigBuilder.forceProxyDomains(parent.sanitized())
+        #expect(!forced.contains("a.example.net"))
+        #expect(forced.contains("example.network"), "只是后缀字符相同、不是子域的不能被误伤")
+
+        // 反方向：父域强制代理、子域直连。路由上直连规则在前，DNS 也要让子域先命中国内 DoH
+        var child = GuardSettings()
+        child.customProxyDomains = ["example.org"]
+        child.customDirectDomains = ["cdn.example.org"]
+        let cy = MihomoConfigBuilder.build(settings: child, runtime: runtime)
+        let directDNS = cy.range(of: "\"+.cdn.example.org\": [\"https://223.5.5.5")
+        let parentDNS = cy.range(of: "\"+.example.org\": [\"https://1.1.1.1")
+        #expect(directDNS != nil && parentDNS != nil && directDNS!.lowerBound < parentDNS!.lowerBound)
+        let cr = MihomoConfigBuilder.rules(settings: child.sanitized(), mode: .proxy)
+        #expect(cr.firstIndex(of: "DOMAIN-SUFFIX,cdn.example.org,\(GroupName.gateDirect)")!
+                < cr.firstIndex(of: "DOMAIN-SUFFIX,example.org,\(GroupName.gateMain)")!)
+    }
+
+    @Test func forceProxyCatalogIsClean() {
+        let list = ForceProxyCatalog.suffixes
+        #expect(DomainSanitizer.clean(list) == list, "内置强制代理名单含非法或重复域名")
+        #expect(list.contains("browserleaks.com") && list.contains("whatismyip.com"))
+    }
+
     @Test func noSubscriptionFallsBackToDirect() {
         let rt = CoreRuntime(secret: "s", listenerPassword: "p", hasSubscription: false)
         let yaml = MihomoConfigBuilder.build(settings: GuardSettings(), runtime: rt)
@@ -201,6 +264,7 @@ struct ConfigBuilderTests {
             var s = GuardSettings()
             s.mode = mode
             s.routing = routing
+            s.customProxyDomains = ["leak.example.org"]
             var rt = runtime
             rt.hasSubscription = sub
             rt.tunEnabled = false
@@ -233,6 +297,12 @@ struct PFRulesTests {
             }
             #expect(r.contains("block drop out quick inet6 all") || r.contains("block return out quick inet6 all"))
         }
+        // root 的 DNS 例外只放 IPv4，不能让 IPv6 DNS 抢在 IPv6 封锁之前漏出
+        for policy in [PFPolicy.leakGuard(tun: "utun199"), .lockdown, .basic(tun: "utun199")] {
+            let r = PFRulesBuilder.rules(for: policy)
+            #expect(r.contains("pass out quick inet proto { tcp udp } from any to any port { 53 853 } user 0 no state"))
+            #expect(!r.contains("pass out quick proto { tcp udp } from any to any port { 53 853 } user 0"))
+        }
     }
 
     /// 大陆白名单熔断规则：用真实的大陆 IP 表让 pfctl 解析（不需要 root）
@@ -244,6 +314,12 @@ struct PFRulesTests {
             let rules = PFRulesBuilder.rules(for: .whitelist(tun: "utun199", allowTUN: allowTUN, cnTable: table,
                                                              allow: ["104.21.1.1", "bad; pass all", "300.1.1.1"]))
             #expect(rules.contains("pass out quick on utun199") == allowTUN, "闸门确认前不能放行 TUN")
+            #expect(!rules.contains("pass out quick on utun199 all"), "白名单的 TUN 放行排在 IPv6 封锁前，只能放 IPv4")
+            // 回归：系统 DNS 锁在 TUN 里，TUN 放行必须排在 53/853 封锁之前，否则白名单熔断时应用连大陆域名都解析不了
+            if allowTUN, let tunPass = rules.range(of: "pass out quick on utun199"),
+               let dnsBlock = rules.range(of: "block return out quick proto { tcp udp } from any to any port { 53 853 }") {
+                #expect(tunPass.lowerBound < dnsBlock.lowerBound)
+            }
             #expect(rules.contains("{ 104.21.1.1 }") && !rules.contains("bad") && !rules.contains("300.1.1.1"))
             #expect(rules.contains("to <aiguard_allow> user 0"), "节点例外只给 root 内核")
             #expect(rules.contains("to <aiguard_cn> port { 53 853 } user 0"), "白名单下内核 DNS 只能发往大陆 DNS")

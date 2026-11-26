@@ -125,6 +125,19 @@ struct OnboardingView: View {
     @Environment(GuardStore.self) private var store
 
     var body: some View {
+        if store.daemonNewer {
+            ContentUnavailableView {
+                Label("这个 App 比守护进程旧", systemImage: "arrow.up.app")
+            } description: {
+                Text("已安装的守护进程是 \(store.daemonVersion ?? "新版")，这个界面是 \(AIGuardVersion)。\n请把新版 AIGuard 拖进「应用程序」覆盖旧 App 后再打开，不要用旧版安装，否则会降级并丢失新版设置。")
+            }
+            .padding(40)
+        } else {
+            installPrompt
+        }
+    }
+
+    private var installPrompt: some View {
         VStack(spacing: 22) {
             Image(systemName: "shield.lefthalf.filled.badge.checkmark")
                 .font(.system(size: 64, weight: .regular))
