@@ -1,6 +1,6 @@
 # 🛡️ AI 出差管家（AIGuard）
 
-macOS 专用的代理 + AI 防泄漏守护。目标只有一个：**出差时绝不让 Claude / ChatGPT / Gemini 等 AI 服务看到中国大陆或港澳 IP**。
+macOS 上的代理 + AI 防泄漏守护（另有 [Android](#-android-版kernelsu) 与 [Windows](#-windows-版) 版）。目标只有一个：**出差时绝不让 Claude / ChatGPT / Gemini 等 AI 服务看到中国大陆或港澳 IP**。
 
 - 内置 mihomo（Clash Meta）内核，导入订阅即可用，TUN 全局接管
 - **单线路**：AI 与其余代理流量走同一个「节点选择」，自动排除出口禁区（默认中国大陆/香港/澳门）节点
@@ -159,6 +159,61 @@ su -c sh /data/adb/aiguard/uninstall.sh --purge
 ```
 
 已知限制：基带（uid 1001，VoLTE/短信）与 464XLAT（uid 1029）不受防泄漏层约束；以 root 身份运行的程序可绕过 TUN；热点共享给其他设备的流量不在保护范围；纯 IPv6 的 Wi-Fi 会因封锁 IPv6 而断网（fail-closed）。
+
+## 🪟 Windows 版
+
+`windows/` 是同一套防护的 Windows 移植（Go），需要 Windows 10 21H2 及以上（推荐 Windows 11 22H2+，界面才有 Mica 背景），x64 或 ARM64。纯逻辑（AI 名单、配置生成、熔断状态机、订阅解析）与 macOS/Android 一致，平台层改为：
+
+| macOS | Windows |
+|---|---|
+| LaunchDaemon `aiguardd` | Windows 服务 `AIGuard`（LocalSystem，自动启动，崩溃后 1 秒自动重启）；内核放进「随句柄关闭而终止」的 Job，服务崩溃时内核与 TUN 一起消失 |
+| pf | WFP（Windows Filtering Platform）：自己的 provider + 最高权重子层，规则**持久化**——服务停止、崩溃或重启电脑后依然有效；每次切换策略在一个 WFP 事务里原子完成。普通程序只能经 TUN 出站，内核与服务按程序路径（App ID）放行；控制端口只允许服务与界面连接，探测入站只允许服务 |
+| 系统 DNS 锁到 TUN | 各真实网卡的 IPv4 DNS 锁到 `198.18.0.2`（只改 NameServer，不碰搜索后缀），WFP 拒绝 TUN 之外的 53/853 端口；mihomo 开 `strict-route` 防止多宿主 DNS 泄漏 |
+| `networksetup -setv6off` | 关闭真实网卡的 `ms_tcpip6` 绑定，WFP 拒绝全部 IPv6 出站 |
+| 合盖/睡眠 | 挂起回调里同步写入全部断网，唤醒后按换网熔断重新验证 |
+| 关闭 AI 进程与浏览器 | 只处理交互会话里的进程：可执行文件路径（去掉用户目录部分后）按关键词匹配，`node.exe`/`python.exe` 看实际运行的脚本（能抓到 npm 装的 Claude Code、Codex），WebView2 子进程按宿主程序判断 |
+| Unix socket 控制通道 | 命名管道 `\\.\pipe\aiguard-control`：DACL 只给 SYSTEM、管理员和安装时的用户，另外校验客户端必须是安装目录里的 `AIGuard.exe` |
+| SwiftUI + Liquid Glass | Wails v3 + WebView2 托盘界面，Windows 11 上用 Mica 背景，图表用 ECharts |
+
+WFP 的写法参考了 [wireguard-windows](https://git.zx2c4.com/wireguard-windows/)（tunnel/firewall）与 mihomo 所用 [sing-tun](https://github.com/MetaCubeX/sing-tun) 的 strict-route，WFP 封装用的是 [tailscale/wf](https://github.com/tailscale/wf)（补了事务支持，见 `windows/third_party/wf`）。
+
+在 macOS 上交叉编译出包：
+
+```bash
+scripts/fetch-core.sh && windows/scripts/fetch-core.sh
+```
+
+```bash
+windows/scripts/build.sh
+```
+
+产物是 `build/AIGuard-Windows-<版本>-amd64.zip` 与 `-arm64.zip`。解压后双击 `AIGuard.exe`，点「安装并启动」，在用户账户控制窗口确认；程序装到 `C:\Program Files\AIGuard`，设置与日志在 `C:\ProgramData\AIGuard`（只有管理员可读）。卸载在「熔断与安全」页，或在管理员命令行：
+
+```bash
+"C:\Program Files\AIGuard\aiguard-service.exe" uninstall --purge
+```
+
+断网自救（卸载不完整导致上不了网时）：
+
+```bash
+"C:\Program Files\AIGuard\aiguard-service.exe" firewall-reset
+```
+
+游戏模式（Windows 独有）：默认手动开启（托盘菜单或「熔断与安全」页）；也可以打开「自动检测」，在游戏本体运行（启动器、平台组件、崩溃上报、反作弊等辅助程序不算）或 UU、雷神、迅游、奇游运行时自动进入，退出 1 分钟后恢复。开启后：
+
+- AI 服务一律禁止，不走代理：AI 程序（含 node/python 跑的 Claude Code、Codex 与 WebView2 宿主）立即关闭，游戏模式期间每 1.5 秒查一次、再打开也会被关掉；它们的 App ID 在 WFP 里完全禁止联网，AI 名单的 IP 段对所有程序禁止直连。
+- TUN 照开：AI 网站在内核里按名单拒绝，其余流量直连不走代理；浏览器只能经 TUN 出站。DNS 改为返回真实 IP、关闭 strict-route，加速器按 IP 加的路由和自己的 DNS 都能生效；游戏和加速器可以走任何网卡。
+- 熔断不再断整机网络（AI 本来就全部拒绝）；手动熔断仍按「熔断方式」切到大陆白名单或全部断网。
+
+已知限制：
+
+- 游戏模式下非浏览器程序可以绕过 TUN 直连：没被识别为 AI、名字也不含关键词的 AI 工具，在被扫描关闭之前（最长约 1.5 秒）或改走加速器路由时，能连到不在 AI 名单 IP 段里的 AI 服务。游戏模式下服务若被强行结束，持久化的游戏模式规则会留到服务自动重启（约 1 秒）为止。
+- 防火墙规则持久化，防护服务没运行时会整机断网（有意为之）；Defender 若把 mihomo 当作 PUA 隔离，也会表现为断网，需要把 `C:\Program Files\AIGuard` 加入排除项。
+- WSL2 与 Hyper-V 虚拟机的流量经宿主机转发，不经过 WFP 的 ALE 层：TUN 正常时它们走代理，但熔断时不受防火墙约束。WSL 里的 AI 命令行也不会被关闭。
+- 现代待机（Modern Standby）机型合盖时可能不发传统的挂起通知，此时靠换网检测和心跳熔断，不保证「睡眠前立即断网」。
+- 以 SYSTEM 身份运行的其他程序（会话 0）不会被关闭，它们的流量仍然经过 TUN。
+- 没有代码签名，首次运行会有 SmartScreen 提示；安装时提权运行的是解压目录里的 `aiguard-service.exe`，请从可信来源取得安装包，解压到只有自己能写的位置再安装。
+- `firewall-reset` 会把防护服务改成手动启动，避免重启后规则又被写回；在界面里点「启动防护服务」恢复。
 
 ## 📄 许可证
 
