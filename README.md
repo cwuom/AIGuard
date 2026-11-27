@@ -129,6 +129,37 @@ sudo /Applications/AIGuard.app/Contents/Resources/uninstall.sh --purge
 - 长连接心跳每 2 秒约 1 KB，全天约 50 MB 代理流量；可在设置里调大间隔。「自动选择」每 10 分钟体检一次节点（心跳失败时立即体检），不再每分钟逐个节点握手。
 - 出口国家依赖 Cloudflare trace / ipinfo 的地理库，个别节点可能被误判；误判方向是多熔断而不是少熔断。
 
+## 🤖 Android 版（KernelSU）
+
+`android/` 是同一套防护的 Android 移植，需要 KernelSU（Magisk 也兼容 `/data/adb/service.d`）。纯逻辑（AI 名单、配置生成、熔断状态机、订阅解析）与 macOS 版一致，平台层改为：
+
+| macOS | Android |
+|---|---|
+| LaunchDaemon `aiguardd` | `app_process` 以 root 跑 `com.aiguard.daemon.DaemonMain`，开机脚本 `/data/adb/service.d/aiguard.sh` 拉起，看门狗退避重启 |
+| pf | iptables：`OUTPUT` 第一条挂 `AIGUARD_OUT`（IPv4）/`AIGUARD_OUT6`，nat 表 `AIGUARD_DNS` 把普通 App 的 53 端口重定向到内核 DNS；大陆白名单是独立的 `AIGUARD_CN` 链 |
+| 系统 DNS 锁到 TUN | 关闭「私人 DNS」（DoT 会绕过劫持）+ DNS 重定向 |
+| `networksetup -setv6off` | Wi-Fi/有线网卡 `disable_ipv6`；蜂窝网卡保留（464XLAT 需要），只靠 ip6tables 拒绝 |
+| 合盖/唤醒 | 网卡与 IPv4 地址变化即按换网熔断；深睡眠醒来只重建长连接，不熔断（否则每次唤醒都会挡掉推送） |
+| 关闭 AI 进程与浏览器 | `SIGKILL` + `am force-stop`，Termux 里的 node/python AI 命令行按入口识别 |
+
+界面（Compose）只是遥控器，经 `127.0.0.1:19190` 和 token 与守护进程通信；防火墙只允许 root 和本 App 连接控制端口，探测入站只允许 root。运行文件在 `/data/adb/aiguard/`（日志在 `logs/`）。
+
+```bash
+scripts/fetch-core.sh && android/scripts/fetch-core.sh
+```
+
+```bash
+cd android && ./gradlew :core:test :app:testDebugUnitTest :app:lintDebug :app:assembleRelease
+```
+
+安装 APK 后，在 KernelSU 管理器「超级用户」里允许「AI 出差管家」，打开 App 点「安装守护进程」。卸载在 App 设置页，或：
+
+```bash
+su -c sh /data/adb/aiguard/uninstall.sh --purge
+```
+
+已知限制：基带（uid 1001，VoLTE/短信）与 464XLAT（uid 1029）不受防泄漏层约束；以 root 身份运行的程序可绕过 TUN；热点共享给其他设备的流量不在保护范围；纯 IPv6 的 Wi-Fi 会因封锁 IPv6 而断网（fail-closed）。
+
 ## 📄 许可证
 
 本项目以 [GPL-3.0](LICENSE) 发布。打包进 App 的 mihomo（MIT）和 meta-rules-dat 规则数据（GPL-3.0）等第三方组件，见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

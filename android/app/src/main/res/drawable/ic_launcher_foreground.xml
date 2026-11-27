@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 盾牌 + 对勾：守护在线 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#4FD1A5"
+        android:pathData="M54,28 L75,36 L75,52 C75,66 66,77 54,81 C42,77 33,66 33,52 L33,36 Z" />
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#0F2A24"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:strokeWidth="5"
+        android:pathData="M44,54 L51,61 L65,46" />
+</vector>
