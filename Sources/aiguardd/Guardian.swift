@@ -104,6 +104,7 @@ actor Guardian {
     private var lastAllowRefresh: Date?
     /// 心跳上一次看到的实际出口节点；变化时作废长连接
     private var lastResolvedNode: String?
+    private var lastForcedCheck: Date?
     /// 网络/节点/配置的代次：探测发出后代次变了，结果作废，防止旧线路的结果为新线路解锁
     private var epoch = 0
     private var anchorWarningShown = false
@@ -709,6 +710,7 @@ actor Guardian {
         guard beatEpoch == epoch, settings.enabled else { return 0.2 }
         let now = Date()
         heartbeatAlive = trace != nil
+        if trace == nil { forceAutoHealthCheck() }
         engine.handle(.probe(ms: ms), now: now)
         if let t = trace {
             if let old = exitStatus.trace, old.ip != t.ip {
@@ -730,6 +732,17 @@ actor Guardian {
         }
         // 熔断中加快心跳，恢复更快
         return engine.snapshot.tripped ? min(interval, 1) : interval
+    }
+
+    /// 心跳失败时立刻体检「自动选择」：平时体检 10 分钟一次（省流量），不能等它自己发现节点坏了。
+    /// 20 秒内只触发一次，避免节点全挂时变成体检风暴；用户手动固定了节点时不需要
+    private func forceAutoHealthCheck() {
+        if let last = lastForcedCheck, Date().timeIntervalSince(last) < 20 { return }
+        lastForcedCheck = Date()
+        Task { [api] in
+            guard await api.group(GroupName.proxy)?.now == GroupName.auto else { return }
+            _ = await api.groupDelay(GroupName.auto, url: Self.probeURL, timeoutMs: 3000)
+        }
     }
 
     /// 「节点选择」最终落到的具体节点（穿透「自动选择」）：display 用于记录切换，leaf 是真正的节点

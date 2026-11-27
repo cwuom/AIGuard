@@ -61,6 +61,7 @@ public enum MihomoConfigBuilder {
     static let privateCIDRs = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16",
                                "100.64.0.0/10", "127.0.0.0/8", "224.0.0.0/4", "255.255.255.255/32"]
     static let testURL = "http://cp.cloudflare.com/generate_204"
+    public static let autoCheckIntervalSeconds = 600
     // DNS 服务器全部用 IP，不依赖系统解析；连接方式写死在 # 后缀里，不经过分流规则和闸门，
     // 熔断时（闸门 REJECT）内核自己的解析仍然可用，订阅下载和节点探测不会被卡住
     static let domesticDoH = ["https://223.5.5.5/dns-query", "https://1.12.12.12/dns-query"]
@@ -177,9 +178,12 @@ public enum MihomoConfigBuilder {
         if rt.hasSubscription {
             let exclude = nodeExcludeFilter(s)
             group(&y, name: GroupName.proxy, type: "select", proxies: [GroupName.auto], use: true, exclude: exclude)
-            // fallback 只在当前节点失效时才换线，出口 IP 最稳定，AI 账号不容易触发风控
+            // fallback 只在当前节点失效时才换线，出口 IP 最稳定，AI 账号不容易触发风控。
+            // 体检要经每个节点握手一次，是最大的额外流量：平时 10 分钟一次，
+            // 当前节点连续失败由内核（max-failed-times）和守护进程（心跳失败）立即触发体检，换线速度不受影响
             group(&y, name: GroupName.auto, type: "fallback", proxies: [], use: true, exclude: exclude,
-                  extra: ["url: \(q(testURL))", "interval: 60", "lazy: false", "expected-status: 204"])
+                  extra: ["url: \(q(testURL))", "interval: \(autoCheckIntervalSeconds)", "timeout: 3000",
+                          "max-failed-times: 2", "lazy: false", "expected-status: 204"])
             group(&y, name: GroupName.gateAI, type: "select", proxies: [GroupName.proxy, "REJECT"])
             // 主闸门不含 DIRECT：任何熔断都不会让境外流量（包括名单外的 AI）直连
             group(&y, name: GroupName.gateMain, type: "select", proxies: [GroupName.proxy, "REJECT"])

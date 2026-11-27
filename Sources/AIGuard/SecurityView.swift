@@ -37,7 +37,7 @@ struct SecurityView: View {
                     GlassCard {
                         VStack(alignment: .leading, spacing: 12) {
                             SectionHeader(title: "判定阈值", subtitle: "数值越保守越安全，但误判断网也越多")
-                            stepper("长连接每 \(s.probeIntervalSeconds) 秒心跳一次（同时校验出口）", \.probeIntervalSeconds, 1...10)
+                            stepper("长连接每 \(s.probeIntervalSeconds) 秒心跳一次（同时校验出口，全天约 \(86400 / s.probeIntervalSeconds / 1024) MB）", \.probeIntervalSeconds, 1...10)
                             stepper("心跳连续失败 \(s.failureThreshold) 次即熔断", \.failureThreshold, 1...20)
                             stepper("心跳超过 \(s.latencyThresholdMs) ms 视为失败", \.latencyThresholdMs, 300...10000, step: 100)
                             stepper("恢复前需连续成功 \(s.recoverSuccesses) 次", \.recoverSuccesses, 1...30)

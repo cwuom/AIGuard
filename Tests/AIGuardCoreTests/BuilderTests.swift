@@ -22,6 +22,17 @@ private func run(_ path: String, _ args: [String]) throws -> (Int32, String) {
 }
 
 struct ConfigBuilderTests {
+    /// 省流量：节点体检要经每个节点握手，必须是稀疏的，靠失败次数触发即时体检保证换线速度
+    @Test func autoGroupHealthCheckIsSparseButReactive() {
+        let yaml = MihomoConfigBuilder.build(settings: GuardSettings(), runtime: runtime)
+        let auto = yaml.components(separatedBy: "  - name: \"\(GroupName.auto)\"")[1].components(separatedBy: "  - name:")[0]
+        #expect(auto.contains("interval: \(MihomoConfigBuilder.autoCheckIntervalSeconds)"))
+        #expect(MihomoConfigBuilder.autoCheckIntervalSeconds >= 300)
+        #expect(auto.contains("max-failed-times: 2"))
+        #expect(!yaml.contains("health-check: {enable: true"), "订阅节点不能再单独体检一遍")
+        #expect(GuardSettings().routing == .smart)
+    }
+
     @Test func aiRulesComeBeforeMainlandDirectRules() {
         let rules = MihomoConfigBuilder.rules(settings: GuardSettings(), mode: .proxy)
         let firstAI = rules.firstIndex { $0 == "DOMAIN-SUFFIX,claude.ai,\(GroupName.gateAI)" }

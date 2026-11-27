@@ -11,7 +11,7 @@ public enum AIGuardPaths {
     public static let launchDaemonPlist = "/Library/LaunchDaemons/com.aiguard.daemon.plist"
 }
 
-public let AIGuardVersion = "1.2.1"
+public let AIGuardVersion = "1.2.2"
 
 /// 按数字逐段比较版本号（"1.10.0" > "1.9.2"），非数字段按 0 处理
 public func compareVersions(_ a: String, _ b: String) -> ComparisonResult {
